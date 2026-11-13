@@ -1,0 +1,12 @@
+{
+    
+    "model_path": "/home/cat/Flght_con/flght_control/model/yolov8n_obb_rk3588.rknn",
+    "stream_rtsp":  "rtsp://192.168.144.25:8554/main.264",
+    "stride": 8,
+    "threshold_mask" : 0.7,
+    "mqtt": {
+        "host": "127.0.0.1",
+        "port": 1883,
+        "client_id": "drone-controller"
+    }
+}

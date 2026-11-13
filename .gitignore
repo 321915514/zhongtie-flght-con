@@ -1,0 +1,15 @@
+*.tgz
+*.jpg
+*.jpg.png
+pod_*.jpg
+*_probe.txt
+build/
+install/
+3rdparty/
+model/
+rknpu2/
+nlohmann/
+__pycache__/
+backup_*/
+backups/
+saved_images/

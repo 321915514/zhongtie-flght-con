@@ -1,0 +1,2008 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/*-------------------------------------------
+                Includes
+-------------------------------------------*/
+#include "yolov8_seg.h"
+#include <ctype.h>
+#include <opencv2/opencv.hpp>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <ctime>
+#include <iomanip>
+#include <map>
+#include <mosquitto.h>
+#include <mutex>
+#include <condition_variable>
+#ifdef ENABLE_MANUAL_ANNOTATION
+#include "manual_annotation.h"
+#endif
+#include <nlohmann/json.hpp>
+#include <sstream>
+#include <thread>
+#include <vector>
+// #include <zmq.hpp>   // [无外网板] ZMQ 未使用(相关线程已注释)，解除 libzmq 依赖
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+// 裸 ffmpeg 拉流头（2026-09 取帧加固）：改用 ffmpeg 拉流以支持读超时中断，替代无超时的 cv::VideoCapture。
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libavutil/time.h>
+#include <libswscale/swscale.h>
+}
+#include <fstream>
+#include <unordered_map>
+#include <string>
+#include <filesystem>
+// 使用OpenSSL进行Base64编码
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/buffer.h>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
+#include <semaphore.h>
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/rotating_file_sink.h> //for rotating_logger_mt
+#include <spdlog/sinks/basic_file_sink.h>    //for  basic_logger_mt
+#include <spdlog/sinks/stdout_color_sinks.h>
+using json = nlohmann::json;
+#include <csignal>
+#include <modbus/modbus.h>
+#include <unistd.h>
+#include <cstring>
+#include <time.h>
+#include <stdexcept>
+#include <string>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <numeric>
+#include <cmath>
+// 深度相机（RGBD SDK）四孔检测 —— 集成
+#include "Mv3dRgbdApi.h"
+#include "Mv3dRgbdDefine.h"
+#include "hole_detect.h"
+
+// 双目取帧全局缓存（必须在 get_depth_offset 之前声明，供其缓存最新 RGB）
+std::mutex g_stereo_mtx;
+cv::Mat g_last_stereo_rgb;   // 最新双目 RGB(get_depth_offset 时更新, 供 stereo/grab 回传)
+std::mutex g_rgbd_capture_mtx;   // 串行化深度相机取帧(二次校准 vs stereo/grab 实时抓帧)，防并发 Start 冲突
+/*-------------------------------------------
+  深度相机四孔检测：懒初始化 + 一次性取图，返回 dx/dy(mm)
+-------------------------------------------*/
+static bool get_depth_offset(float& out_dx, float& out_dy, cv::Mat* out_rgb = nullptr, DepthDetectResult* out_res = nullptr, float* out_fx = nullptr, float* out_fy = nullptr) {
+    static void* s_handle = nullptr;
+    static float s_fx = 0.f, s_fy = 0.f;
+    static int s_W = 0, s_H = 0;
+    static bool s_inited = false;
+
+    // 深度相机单会话：二次校准线程与 stereo/grab 回调可能并发取帧，加锁串行化
+    std::lock_guard<std::mutex> _cam_lk(g_rgbd_capture_mtx);
+
+    if (!s_inited) {
+        if (MV3D_RGBD_Initialize() != 0) return false;
+        unsigned int nDev = 0;
+        if (MV3D_RGBD_GetDeviceNumber(DeviceType_Ethernet | DeviceType_USB, &nDev) != 0 || nDev == 0) return false;
+        std::vector<MV3D_RGBD_DEVICE_INFO> devs(nDev);
+        if (MV3D_RGBD_GetDeviceList(DeviceType_Ethernet | DeviceType_USB, &devs[0], nDev, &nDev) != 0) return false;
+        if (MV3D_RGBD_OpenDevice(&s_handle, &devs[0]) != 0) return false;
+        MV3D_RGBD_CAMERA_PARAM cp;
+        if (MV3D_RGBD_GetCameraParam(s_handle, &cp) != 0) return false;
+        s_fx = cp.stRgbCalibInfo.stIntrinsic.fData[0];
+        s_fy = cp.stRgbCalibInfo.stIntrinsic.fData[4];
+        s_W = cp.stRgbCalibInfo.nWidth;
+        s_H = cp.stRgbCalibInfo.nHeight;
+        s_inited = true;
+    }
+
+    if (MV3D_RGBD_Start(s_handle) != 0) return false;
+    MV3D_RGBD_FRAME_DATA fd;
+    memset(&fd, 0, sizeof(fd));
+    bool ok = false;
+    if (MV3D_RGBD_FetchFrame(s_handle, &fd, 3000) == 0) {
+        cv::Mat rgb, depth;
+        for (int i = 0; i < (int)fd.nImageCount; ++i) {
+            const MV3D_RGBD_IMAGE_DATA& im = fd.stImageData[i];
+            if (im.enImageType == ImageType_RGB8_Planar) {
+                cv::Mat bgr(im.nHeight, im.nWidth, CV_8UC3);
+                rgb8_planar_to_bgr((const unsigned char*)im.pData, im.nWidth, im.nHeight, bgr.data);
+                rgb = bgr.clone();
+                { std::lock_guard<std::mutex> lk(g_stereo_mtx); g_last_stereo_rgb = rgb.clone(); }
+            } else if (im.enImageType == ImageType_Depth) {
+                depth = cv::Mat(im.nHeight, im.nWidth, CV_16UC1, (void*)im.pData).clone();
+            }
+        }
+        if (!rgb.empty() && !depth.empty()) {
+            DepthDetectResult r = detect_4holes(rgb, depth, s_fx, s_fy, s_W, s_H);
+            if (out_rgb) *out_rgb = rgb;
+            if (out_res) *out_res = r;
+            if (out_fx) *out_fx = s_fx;
+            if (out_fy) *out_fy = s_fy;
+            if (r.valid) { out_dx = r.dx; out_dy = r.dy; ok = true; }
+        }
+    }
+    MV3D_RGBD_Stop(s_handle);
+    return ok;
+}
+/*-------------------------------------------
+                Global Variables
+-------------------------------------------*/
+
+// ---------------------------------------------------------------------------------------二次纠偏参数和函数------------------------------------------------------------------------------+
+// Modbus通信参数
+const int SLAVE_ADDRESS = 0x02;      // 从机地址
+const int RESPONSE_TIMEOUT_SEC = 1;  // 响应超时时间(秒)
+const int RESPONSE_TIMEOUT_USEC = 0; // 响应超时时间(微秒)
+const int CALIBRATION_TIMEOUT = 10;  // 校准超时时间(秒)
+const int RESET_DELAY = 40;          // 复位后等待时间(秒)
+
+// 机械限位参数
+const int MAX_X_DISTANCE = 150; // X轴移动最大距离(mm)
+const int MAX_Y_DISTANCE = 150; // Y轴最大移动距离(mm)
+
+// 串口与波特率（修复变量名语义）
+const int BAUD_RATE = 115200;                 // 波特率（语义正确）
+const std::string SERIAL_PATH = "/dev/ttyS5"; // 串口路径
+
+// 方向定义
+const uint16_t DIRECTION_LEFT = 1;  // 左移
+const uint16_t DIRECTION_RIGHT = 2; // 右移
+
+// 输入寄存器地址
+const uint16_t X_POSITION_REACHED = 0x1004; // X轴到位状态
+const uint16_t Y_POSITION_REACHED = 0x1005; // Y轴到位状态
+const uint16_t GYRO_CALIBRATED = 0x1006;    // 陀螺仪校准状态
+
+// 保持寄存器地址
+const uint16_t RESET_TO_CENTER = 0x2000;    // 复位到中心
+const uint16_t X_MOVE_DISTANCE = 0x2001;    // X轴移动距离
+const uint16_t X_MOVE_DIRECTION = 0x2002;   // X轴移动方向
+const uint16_t Y_MOVE_DISTANCE = 0x2003;    // Y轴移动距离
+const uint16_t Y_MOVE_DIRECTION = 0x2004;   // Y轴移动方向
+const uint16_t SEND_CALIBRATE_CMD = 0x2007; // 下发校准指令
+
+// 日志系统：优先写滚动文件；目录/文件无法创建时降级到控制台日志，绝不让启动崩溃（软失败）
+// 此前用相对路径 "log/rotating_log.log"，工作目录不含 log 子目录时 spdlog 抛异常导致程序 abort。
+static std::shared_ptr<spdlog::logger> _s_create_logger() {
+    try {
+        std::filesystem::create_directories("/home/cat/Flght_con/flght_control/install/rk3588_linux/log");
+        std::filesystem::create_directories("/home/cat/Flght_con/flght_control/saved_images");
+        return spdlog::rotating_logger_mt("rotating_logger",
+            "/home/cat/Flght_con/flght_control/install/rk3588_linux/log/rotating_log.log",
+            5 * 1024 * 1024, 20);
+    } catch (const std::exception &e) {
+        std::cerr << "[log] 滚动日志创建失败，降级到控制台日志: " << e.what() << std::endl;
+        return spdlog::stderr_color_mt("rotating_logger");
+    }
+}
+auto rotating_logger = _s_create_logger();
+
+class DroneController
+{
+private:
+    modbus_t *ctx;    // Modbus上下文
+    int serial_fd;    // 串口文件描述符
+    const char *port; // 串口端口
+    int baudrate;     // 波特率
+
+    // 私有辅助函数 - 初始化Modbus
+    bool initModbus()
+    {
+        ctx = modbus_new_rtu(port, baudrate, 'N', 8, 1);
+        if (ctx == NULL)
+        {
+            std::cerr << "无法创建Modbus上下文: " << modbus_strerror(errno) << std::endl;
+            return false;
+        }
+
+        if (modbus_set_slave(ctx, SLAVE_ADDRESS) == -1)
+        {
+            std::cerr << "设置从机地址失败: " << modbus_strerror(errno) << std::endl;
+            modbus_free(ctx);
+            return false;
+        }
+
+        serial_fd = modbus_connect(ctx);
+        if (serial_fd == -1)
+        {
+            std::cerr << "无法连接到从机: " << modbus_strerror(errno) << std::endl;
+            modbus_free(ctx);
+            return false;
+        }
+
+        if (modbus_set_response_timeout(ctx, RESPONSE_TIMEOUT_SEC, RESPONSE_TIMEOUT_USEC) == -1)
+        {
+            std::cerr << "设置超时失败: " << modbus_strerror(errno) << std::endl;
+            modbus_close(ctx);
+            modbus_free(ctx);
+            return false;
+        }
+
+        return true;
+    }
+
+public:
+    // 构造函数
+    DroneController(const char *port, int baudrate) : port(port), baudrate(baudrate), ctx(nullptr), serial_fd(-1)
+    {
+        if (!initModbus())
+        {
+            std::cout << "[WARN] Modbus初始化失败（无设备），将以无Modbus模式运行" << std::endl;
+            // 不抛异常：ctx 保持 nullptr，后续读写调用会安全跳过
+        }
+        else
+        {
+            std::cout << "Modbus初始化成功" << std::endl;
+        }
+    }
+
+    // 析构函数
+    ~DroneController()
+    {
+        if (ctx != nullptr)
+        {
+            modbus_close(ctx);
+            modbus_free(ctx);
+        }
+    }
+
+    // 读取输入寄存器状态
+    bool readInputStatus(uint16_t addr, uint16_t &value)
+    {
+        if (ctx == nullptr)
+        {
+            std::cout << "[WARN] Modbus未初始化，跳过读取输入寄存器 (0x" << std::hex << addr << std::dec << ")" << std::endl;
+            return false;
+        }
+        uint16_t dest[1];
+        int rc = modbus_read_input_registers(ctx, addr, 1, dest);
+        if (rc != 1)
+        {
+            std::cerr << "读取输入寄存器失败 (0x" << std::hex << addr << "): "
+                      << modbus_strerror(errno) << std::dec << std::endl;
+            return false;
+        }
+        value = dest[0];
+        return true;
+    }
+
+    // 写入保持寄存器
+    bool writeHoldingRegister(uint16_t addr, uint16_t value)
+    {
+        if (ctx == nullptr)
+        {
+            std::cout << "[WARN] Modbus未初始化，跳过写入保持寄存器 (0x" << std::hex << addr << std::dec << ")" << std::endl;
+            return false;
+        }
+        int rc = modbus_write_register(ctx, addr, value);
+        if (rc != 1)
+        {
+            std::cerr << "写入保持寄存器失败 (0x" << std::hex << addr << "): "
+                      << modbus_strerror(errno) << std::dec << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    // 复位到中心位置（修复：增加复位状态验证）
+    bool resetToCenter()
+    {
+        std::cout << "复位到中心位置..." << std::endl;
+        // 1. 下发复位指令
+        if (!writeHoldingRegister(RESET_TO_CENTER, 1))
+            return false;
+        // 2. 等待复位机械动作
+        std::cout << "等待复位完成..." << std::endl;
+        sleep(40);
+        std::cout << "复位完成" << std::endl;
+        return true;
+    }
+
+    // X轴移动（原有逻辑正确）
+    bool moveX(int distance, bool left)
+    {
+        if (distance > MAX_X_DISTANCE)
+        {
+            std::cerr << "X轴移动距离不能超过" << MAX_X_DISTANCE << "mm" << std::endl;
+            return false;
+        }
+        std::cout << "X轴" << (left ? "左移" : "右移") << distance << "mm..." << std::endl;
+        if (!writeHoldingRegister(X_MOVE_DISTANCE, distance))
+            return false;
+        if (!writeHoldingRegister(X_MOVE_DIRECTION, left ? DIRECTION_LEFT : DIRECTION_RIGHT))
+            return false;
+        return true;
+    }
+
+    // Y轴移动（原有逻辑正确）
+    bool moveY(int distance, bool left)
+    {
+        if (distance > MAX_Y_DISTANCE)
+        {
+            std::cerr << "Y轴移动距离不能超过" << MAX_Y_DISTANCE << "mm" << std::endl;
+            return false;
+        }
+        std::cout << "Y轴" << (left ? "左移" : "右移") << distance << "mm..." << std::endl;
+        if (!writeHoldingRegister(Y_MOVE_DISTANCE, distance))
+            return false;
+        if (!writeHoldingRegister(Y_MOVE_DIRECTION, left ? DIRECTION_LEFT : DIRECTION_RIGHT))
+            return false;
+        return true;
+    }
+
+    // 发送校准指令（原有逻辑正确）
+    bool sendCalibrateCommand()
+    {
+        std::cout << "发送校准指令..." << std::endl;
+        if (!writeHoldingRegister(SEND_CALIBRATE_CMD, 1))
+            return false;
+        sleep(CALIBRATION_TIMEOUT);
+        if (!writeHoldingRegister(SEND_CALIBRATE_CMD, 0))
+            return false;
+        return true;
+    }
+
+    // 打印设备核心状态（原有逻辑正确）
+    void printDeviceStatus()
+    {
+        uint16_t x_reached, y_reached, gyro_calib;
+        std::cout << "\n设备当前状态:" << std::endl;
+        if (readInputStatus(X_POSITION_REACHED, x_reached))
+        {
+            std::cout << "X轴到位状态: " << (x_reached ? "已到位" : "未到位") << std::endl;
+        }
+        if (readInputStatus(Y_POSITION_REACHED, y_reached))
+        {
+            std::cout << "Y轴到位状态: " << (y_reached ? "已到位" : "未到位") << std::endl;
+        }
+        if (readInputStatus(GYRO_CALIBRATED, gyro_calib))
+        {
+            std::cout << "陀螺仪状态: " << (gyro_calib ? "已完成纠偏" : "未完成纠偏") << std::endl;
+        }
+    }
+};
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+
+//----------------------------------------------------------------------------------------降落纠偏参数和函数------------------------------------------------------------------------------+
+// 全局变量（MQTT 通信）
+struct mosquitto *g_mosq = nullptr;                // MQTT 客户端句柄
+std::atomic<bool> g_mqtt_connected{false};         // MQTT 连接状态（on_connect/on_disconnect 维护）
+std::atomic<uint16_t> g_msgid{0};                  // detection msgid 自增，>65535 回绕 0
+std::atomic<bool> g_calib_req{false};              // aruco/stop → 二次校准请求
+std::atomic<bool> g_reset_req{false};              // aruco/reset → 复位应答请求
+std::atomic<int> g_calib_state{0};                 // 当前校准状态：0=未纠偏 1=纠偏中 2=纠偏完成
+std::atomic<bool> g_status_run{true};              // 校准状态 1Hz 发布线程开关
+std::thread g_status_thread;                       // 校准状态 1Hz 发布线程
+std::atomic<bool> g_calib_busy{false};             // 校准线程运行中（主循环据此跳过 reset 抢占、防止重复启动）
+std::atomic<int> g_complete_remaining{0};          // aruco/reset/complete=1 的剩余持续秒数（10 秒窗口）
+
+// 人工标注回流：等待遥控器回传的标注点（编译期可裁剪，见 CMake 选项 ENABLE_MANUAL_ANNOTATION）
+#ifdef ENABLE_MANUAL_ANNOTATION
+std::mutex g_manual_mtx;
+std::condition_variable g_manual_cv;
+std::vector<manual_annotation::ManualPoint> g_manual_pts;
+bool g_manual_ready = false;
+#endif
+
+// MQTT 断线自愈 watchdog（2026-08-21 加固：时钟跳变/网络抖动导致自动重连失效时强制恢复）
+std::atomic<int64_t> g_mqtt_last_seen{0};          // 最后确认连接的时刻(steady ms)，用于判定断线时长
+std::atomic<int64_t> g_mqtt_last_reconnect{0};     // 最后主动重连的时刻(steady ms)，限制重连频率
+std::atomic<int> g_mqtt_reconnect_fail{0};         // 连续主动重连失败次数，达阈值主动退出交 systemd 拉起
+
+// 单调时钟毫秒（时钟跳变不影响：watchdog 判定用 steady_clock 而非 wall clock）
+static int64_t now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::string g_mqtt_host = "127.0.0.1";             // config.json [mqtt].host
+int g_mqtt_port = 1883;                            // config.json [mqtt].port
+std::string g_mqtt_client_id = "drone-controller"; // config.json [mqtt].client_id
+
+// MQTT 主题常量（MQTT接口协议.md）
+const char *TOPIC_DETECTION      = "aruco/detection";
+const char *TOPIC_CALIB_STATUS   = "aruco/calibrate/status";
+const char *TOPIC_STOP           = "aruco/stop";
+const char *TOPIC_RESET          = "aruco/reset";
+const char *TOPIC_RESET_COMPLETE = "aruco/reset/complete";
+const char *TOPIC_STATUS         = "aruco/status";
+const char *TOPIC_STEREO_GRAB  = "stereo/grab";    // 遥控器请求双目图
+const char *TOPIC_STEREO_IMAGE = "stereo/image";   // 双目图回传(base64 JPEG)
+std::string base64_encode(const std::vector<unsigned char> &data);  // 前向声明(定义在文件后部)
+#ifdef ENABLE_MANUAL_ANNOTATION
+const char *TOPIC_MANUAL_REQ    = "aruco/manual/request";
+const char *TOPIC_MANUAL_RESP   = "aruco/manual";
+const char *TOPIC_MANUAL_RESULT = "aruco/manual/result";
+#endif
+
+// 二次校准读图路径
+const char *GAO_JPG = "/home/cat/Flght_con/flght_control/saved_images/gao.jpg";
+cv::Point2f er_center;
+cv::Mat frame2;
+bool flagimg = false;
+bool flagimg1 = false;
+// 辅助函数：计算两点间距离
+double getDist(cv::Point2f p1, cv::Point2f p2) {
+    return std::sqrt(std::pow(p1.x - p2.x, 2) + std::pow(p1.y - p2.y, 2));
+}
+
+/**
+ * 核心逻辑：根据检测到的孔位计算工件中心
+ */
+cv::Point2i calculateIndustrialCenterLogic(const std::vector<cv::Point2i>& holeCenters, 
+                                          const std::vector<int>& holeRadii,
+                                          cv::Point2i refCenter = cv::Point2i(640, 360)) 
+{
+    int numPoints = static_cast<int>(holeCenters.size());
+    if (numPoints == 0) return cv::Point2i(-1, -1);
+
+    cv::Point2d finalCenter(-1, -1);
+
+    // --- 情况 A: 3个及以上点，使用最小二乘法拟合外心 ---
+    if (numPoints >= 3) {
+        // 构建线性方程组 A * X = B
+        // 2*xi*xc + 2*yi*yc + C = xi^2 + yi^2
+        cv::Mat A(numPoints, 3, CV_64F);
+        cv::Mat B(numPoints, 1, CV_64F);
+
+        for (int i = 0; i < numPoints; ++i) {
+            double xi = holeCenters[i].x;
+            double yi = holeCenters[i].y;
+            A.at<double>(i, 0) = 2.0 * xi;
+            A.at<double>(i, 1) = 2.0 * yi;
+            A.at<double>(i, 2) = 1.0;
+            B.at<double>(i, 0) = xi * xi + yi * yi;
+        }
+
+        cv::Mat X;
+        cv::solve(A, B, X, cv::DECOMP_SVD);
+        finalCenter.x = X.at<double>(0, 0);
+        finalCenter.y = X.at<double>(1, 0);
+    }
+    // --- 情况 B: 只有2个点，执行几何补全逻辑 ---
+    else if (numPoints == 2) {
+        cv::Point2d p1(holeCenters[0].x, holeCenters[0].y);
+        cv::Point2d p2(holeCenters[1].x, holeCenters[1].y);
+        
+        cv::Point2d mid = (p1 + p2) * 0.5;
+        cv::Point2d v = p2 - p1;
+        double L = cv::norm(v);
+        
+        double dx = std::abs(p1.x - p2.x);
+        double dy = std::abs(p1.y - p2.y);
+        int max_d = *std::max_element(holeRadii.begin(), holeRadii.end()) * 2;
+
+        if (dx > max_d && dy > max_d) {
+            // 对角线分布
+            finalCenter = mid;
+        } else {
+            // 相邻分布：在垂直平分线上取 L/2 距离的点
+            // 计算单位法向量 n = (-vy, vx) / L
+            cv::Point2d normal(-v.y / L, v.x / L);
+            cv::Point2d pt_a = mid + normal * (L * 0.5);
+            cv::Point2d pt_b = mid - normal * (L * 0.5);
+
+            // 选择靠近图像参考中心的点
+            double dist_a = cv::norm(pt_a - (cv::Point2d)refCenter);
+            double dist_b = cv::norm(pt_b - (cv::Point2d)refCenter);
+            finalCenter = (dist_a < dist_b) ? pt_a : pt_b;
+        }
+    }
+
+    // 绘制最终中心
+    if (finalCenter.x != -1) {
+        cv::Point cp(std::round(finalCenter.x), std::round(finalCenter.y));
+        // cv::drawMarker(drawImg, cp, cv::Scalar(0, 0, 255), cv::MARKER_CROSS, 60, 5);
+        // std::string txt = "Center: (" + std::to_string(cp.x) + "," + std::to_string(cp.y) + ")";
+        // cv::putText(drawImg, txt, cv::Point(cp.x + 20, cp.y - 20), 
+        //             cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 255), 2);
+        return cp;
+    }
+
+    return cv::Point2i(-1, -1);
+}
+
+/**
+ * 主检测函数：输入图片，输出孔位信息及中心点
+ */
+cv::Point2i detectHoleCenters(const cv::Mat& imgArray,
+                                      std::vector<cv::Point2i>& holeCenters,
+                                      std::vector<int>& holeRadii)
+{
+    holeCenters.clear();
+    holeRadii.clear();
+
+    // 1. 预处理
+    cv::Mat gray, blur, thresh, morph;
+    if (imgArray.channels() == 3) cv::cvtColor(imgArray, gray, cv::COLOR_BGR2GRAY);
+    else gray = imgArray.clone();
+
+    cv::GaussianBlur(gray, blur, cv::Size(9, 9), 0);
+    // 使用常规阈值处理（与你 Python 代码一致）
+    cv::threshold(blur, thresh, 120, 255, cv::THRESH_BINARY_INV);
+    
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(15, 15));
+    cv::morphologyEx(thresh, morph, cv::MORPH_CLOSE, kernel);
+
+    // 2. 轮廓提取
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(morph, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    // 3. 提取孔洞内接圆
+    for (const auto& cnt : contours) {
+        double area = cv::contourArea(cnt);
+        if (area > 3500) {
+            // 创建掩膜用于距离变换
+            cv::Mat mask = cv::Mat::zeros(morph.size(), CV_8UC1);
+            std::vector<std::vector<cv::Point>> oneCnt = {cnt};
+            cv::drawContours(mask, oneCnt, -1, 255, -1);
+
+            cv::Mat dist;
+            cv::distanceTransform(mask, dist, cv::DIST_L2, 5);
+
+            double maxVal;
+            cv::Point maxLoc;
+            cv::minMaxLoc(dist, nullptr, &maxVal, nullptr, &maxLoc);
+
+            int cX = maxLoc.x;
+            int cY = maxLoc.y;
+            int radius = static_cast<int>(maxVal);
+
+            // X 坐标区间过滤 (333 ~ 933)
+            if (cX > 333 && cX < 933) {
+                holeCenters.push_back(cv::Point2i(cX, cY));
+                holeRadii.push_back(radius);
+            }
+        }
+    }
+
+    // 4. 调用几何逻辑计算中心
+    return calculateIndustrialCenterLogic(holeCenters, holeRadii);
+}
+
+// 初始化modbus
+DroneController controller(SERIAL_PATH.c_str(), BAUD_RATE);
+
+// 浮点归整，避免 JSON 中 0.01 序列化为 0.00999999
+double round4(double v) { return std::round(v * 1e4) / 1e4; }
+
+// 模型输出的矩形朝向角 -> 发布给飞控的 rotation（转正所需最小角度）。
+// 模型角 theta 范围 [-45°, 135°)（长边相对 x 轴，顺时针正）；
+// 矩形具 90° 周期性（0° 水平、90° 竖直均为已摆正），故先按 90° 取模，再折算到 (-45°, +45°]。
+// 半开区间左开右闭：固定取 +45° 而舍弃 -45°，避免同一物理朝向在 ±45 之间来回跳。
+float min_straighten_angle(float theta)
+{
+    const float Q = 0.7853981634f; // π/4 = 45°
+    const float H = 1.5707963268f; // π/2 = 90°
+    float r = fmodf(theta + Q, H); // -> (-90°, 90°)
+    if (r < 0.0f)
+        r += H; // -> [0°, 90°)
+    if (r <= 1e-6f)
+        r = H; // 边界取 +45°，不取 -45°
+    float ang = r - Q; // -> (-45°, +45°]
+
+    // 2026-11-10 修复：45° 边界附近（距 ±45° 约 3° 内）符号会因噪声在 +45/-45 间跳变，
+    // 飞控看到方向来回翻 -> "不知道往哪边转"。此处统一固定为 +45°
+    // （矩形 90° 对称，+45° 与 -45° 转正效果等价，只是方向统一、不再抖）。
+    const float NEAR45 = Q - 0.0523599f; // 45° - 3° = 42°
+    if (fabsf(ang) >= NEAR45)
+        ang = Q; // 固定 +45°
+
+    return ang;
+}
+
+// 统一 MQTT 发布入口（软失败：未连接时静默跳过，不报错不崩溃）
+bool publish_json(const char *topic, const json &payload, int qos, bool retain)
+{
+    if (g_mosq == nullptr || !g_mqtt_connected.load()) return false;
+    std::string s = payload.dump();
+    int rc = mosquitto_publish(g_mosq, nullptr, topic, (int)s.size(), s.c_str(), qos, retain);
+    if (rc != MOSQ_ERR_SUCCESS)
+    {
+        rotating_logger->warn("MQTT 发布 {} 失败 rc={}", topic, rc);
+        return false;
+    }
+    return true;
+}
+
+// 发布降落纠偏值（aruco/detection，QoS0），msgid 自增
+void publish_detection(bool valid, float dx, float dy, float rotation)
+{
+    if (g_mosq == nullptr || !g_mqtt_connected.load()) return;
+    uint16_t mid = (uint16_t)(g_msgid.load() + 1); // 自增，>65535 回绕 0
+    g_msgid.store(mid);
+    json j = {
+        {"msgid", mid},
+        {"valid", valid},
+        {"dx", round4(dx)},
+        {"dy", round4(dy)},
+        {"dz", 1.0},                   // 协议固定默认值，飞控自行控制下降
+        {"rotation", round4(rotation)}
+    };
+    publish_json(TOPIC_DETECTION, j, 0, false);
+}
+
+// 发布二次校准状态（aruco/calibrate/status，QoS1）
+void publish_calib_status(int status)
+{
+    g_calib_state.store(status);                    // 同步本地校准状态（aruco/reset 判断用）
+    publish_json(TOPIC_CALIB_STATUS, json{{"status", status}}, 1, false);
+}
+
+#ifdef ENABLE_MANUAL_ANNOTATION
+// 发布人工标注请求（aruco/manual/request，QoS1）
+void publish_manual_request(const std::string& image_id, const std::string& image_url,
+                            const std::string& auto_holes, const std::string& reason)
+{
+    json j = {{"image_id", image_id}, {"image_url", image_url},
+              {"auto_holes", json::parse(auto_holes)}, {"reason", reason}};
+    publish_json(TOPIC_MANUAL_REQ, j, 1, false);
+}
+
+// 等待遥控器回传人工标注点（aruco/manual），超时返回 false
+bool wait_manual_points(std::vector<manual_annotation::ManualPoint>& pts, int timeout_s)
+{
+    std::unique_lock<std::mutex> lk(g_manual_mtx);
+    g_manual_ready = false;
+    g_manual_pts.clear();
+    if (!g_manual_cv.wait_for(lk, std::chrono::seconds(timeout_s), [] { return g_manual_ready; }))
+        return false;
+    pts = g_manual_pts;
+    return !pts.empty();
+}
+#endif
+
+// MQTT 连接成功回调（loop 线程，轻量）：置在线、重订阅、初始化状态
+void on_mqtt_connect(struct mosquitto * /*mosq*/, void * /*obj*/, int rc)
+{
+    if (rc != 0)
+    {
+        rotating_logger->warn("MQTT 连接失败 rc={}，等待自动重连", rc);
+        std::cerr << "[MQTT] 连接失败 rc=" << rc << "，等待自动重连" << std::endl;
+        return;
+    }
+    g_mqtt_connected.store(true);
+    g_mqtt_last_seen.store(now_ms());
+    rotating_logger->info("MQTT 已连接 {}:{}", g_mqtt_host, g_mqtt_port);
+    std::cerr << "[MQTT] 已连接 " << g_mqtt_host << ":" << g_mqtt_port << std::endl;
+    publish_json(TOPIC_STATUS, json("online"), 1, true);       // 在线置位，覆盖 will 的 offline
+    mosquitto_subscribe(g_mosq, nullptr, TOPIC_STOP, 1);       // clean_session=true，每次重连需重新订阅
+    mosquitto_subscribe(g_mosq, nullptr, TOPIC_RESET, 1);
+    mosquitto_subscribe(g_mosq, nullptr, TOPIC_STEREO_GRAB, 1);       // 双目取帧请求
+#ifdef ENABLE_MANUAL_ANNOTATION
+    mosquitto_subscribe(g_mosq, nullptr, TOPIC_MANUAL_RESP, 1);       // 人工标注回传
+#endif
+    publish_calib_status(0);                                   // 初始化：未纠偏
+}
+
+// MQTT 连接断开回调
+void on_mqtt_disconnect(struct mosquitto * /*mosq*/, void * /*obj*/, int rc)
+{
+    g_mqtt_connected.store(false);
+    if (rc != 0)
+    {
+        rotating_logger->warn("MQTT 连接断开 rc={}，尝试重连", rc);
+        std::cerr << "[MQTT] 连接断开 rc=" << rc << "，尝试重连" << std::endl;
+    }
+}
+
+// MQTT 消息回调（loop 线程，只置 flag，严禁阻塞/sleep/调用 controller）
+void on_mqtt_message(struct mosquitto * /*mosq*/, void * /*obj*/, const struct mosquitto_message *msg)
+{
+    if (msg == nullptr || msg->topic == nullptr || msg->payload == nullptr) return;
+    std::string topic(msg->topic);
+    std::string payload(static_cast<const char *>(msg->payload), msg->payloadlen);
+    try
+    {
+        json j = json::parse(payload);
+        if (topic == TOPIC_STOP)
+        {
+            if (j.value("cmd", "") == "calibrate" && !g_calib_req.exchange(true))
+            {
+                rotating_logger->info("收到 aruco/stop(calibrate)，排队执行二次校准");
+            }
+        }
+        else if (topic == TOPIC_RESET)
+        {
+            if (j.value("cmd", "") == "reset" && !g_reset_req.exchange(true))
+            {
+                rotating_logger->info("收到 aruco/reset(reset)，排队执行手动复位");
+            }
+        }
+        else if (topic == TOPIC_STEREO_GRAB)
+        {
+            if (j.value("cmd", "") == "grab")
+            {
+                // 方案A：收到 grab 实时抓一帧双目 RGB（复用 get_depth_offset 的取帧，顺带刷新 g_last_stereo_rgb）
+                cv::Mat rgb;
+                {
+                    float _fdx = 0.f, _fdy = 0.f;
+                    get_depth_offset(_fdx, _fdy, &rgb);
+                }
+                if (rgb.empty())
+                {
+                    // 联调测试：无相机时加载测试图充当双目帧(接相机后此分支不命中)
+                    rgb = cv::imread("/home/cat/stereo_test_frame.jpg", cv::IMREAD_COLOR);
+                }
+                if (rgb.empty())
+                {
+                    publish_json(TOPIC_STEREO_IMAGE, json{{"img", ""}, {"error", "no_frame"}}, 1, false);
+                }
+                else
+                {
+                    int max_side = 1280;
+                    if (rgb.cols > max_side || rgb.rows > max_side)
+                    {
+                        double s = (double)max_side / std::max(rgb.cols, rgb.rows);
+                        cv::resize(rgb, rgb, cv::Size(), s, s, cv::INTER_AREA);
+                    }
+                    std::vector<unsigned char> buf;
+                    cv::imencode(".jpg", rgb, buf, { cv::IMWRITE_JPEG_QUALITY, 70 });
+                    std::string b64 = base64_encode(buf);
+                    publish_json(TOPIC_STEREO_IMAGE, json{{"img", b64}}, 1, false);
+                }
+            }
+        }
+#ifdef ENABLE_MANUAL_ANNOTATION
+        else if (topic == TOPIC_MANUAL_RESP)
+        {
+            std::vector<manual_annotation::ManualPoint> pts;
+            std::string err;
+            if (manual_annotation::parse_annotation_json(payload, pts, err)) {
+                std::lock_guard<std::mutex> lk(g_manual_mtx);
+                g_manual_pts = pts;
+                g_manual_ready = true;
+            } else {
+                rotating_logger->warn("人工标注解析失败: {}", err);
+            }
+            g_manual_cv.notify_all();
+        }
+#endif
+    }
+    catch (const nlohmann::json::exception &e)
+    {
+        rotating_logger->warn("MQTT 消息解析失败 topic={}: {}", topic, e.what());
+    }
+    // msg 由 libmosquitto 管理，回调返回后自动释放，不得保存指针
+}
+
+
+// 初始化MQTT连接：后台异步连接 + 自动重连（软失败：MQTT不可用不报错，无MQTT模式继续运行）
+bool init_mqtt()
+{
+    if (mosquitto_lib_init() != MOSQ_ERR_SUCCESS)
+    {
+        rotating_logger->warn("mosquitto_lib_init 失败，MQTT 不可用，以无MQTT模式继续运行");
+        std::cerr << "[MQTT] mosquitto_lib_init 失败，无MQTT模式" << std::endl;
+        return false;
+    }
+    g_mosq = mosquitto_new(g_mqtt_client_id.c_str(), true, nullptr); // clean_session=true
+    if (g_mosq == nullptr)
+    {
+        rotating_logger->warn("mosquitto_new 失败，MQTT 不可用，以无MQTT模式继续运行");
+        std::cerr << "[MQTT] mosquitto_new 失败(client_id=" << g_mqtt_client_id << ")，无MQTT模式" << std::endl;
+        return false;
+    }
+    mosquitto_connect_callback_set(g_mosq, on_mqtt_connect);
+    mosquitto_disconnect_callback_set(g_mosq, on_mqtt_disconnect);
+    mosquitto_message_callback_set(g_mosq, on_mqtt_message);
+    mosquitto_reconnect_delay_set(g_mosq, 1, 30, true); // 快速首连 + 指数退避
+    // 遗嘱消息：连接异常断开时 broker 发布 aruco/status "offline"（retain）
+    mosquitto_will_set(g_mosq, TOPIC_STATUS, (int)strlen("offline"), "offline", 1, true);
+
+    int rc = mosquitto_connect_async(g_mosq, g_mqtt_host.c_str(), g_mqtt_port, 60); // keepalive 60s
+    if (rc != MOSQ_ERR_SUCCESS)
+    {
+        rotating_logger->warn("MQTT connect_async rc={}，进入后台重连", rc);
+    }
+    if (mosquitto_loop_start(g_mosq) != MOSQ_ERR_SUCCESS)
+    {
+        rotating_logger->warn("mosquitto_loop_start 失败，MQTT 不可用，以无MQTT模式继续运行");
+        mosquitto_destroy(g_mosq);
+        g_mosq = nullptr;
+        return false;
+    }
+    rotating_logger->info("MQTT 子系统已启动 host={}:{}", g_mqtt_host, g_mqtt_port);
+    return true;
+}
+
+// 资源释放：清除 retained 状态并销毁 MQTT 连接
+void cleanup_mqtt()
+{
+    if (g_mosq != nullptr)
+    {
+        if (g_mqtt_connected.load())
+        {
+            // 空 payload + retain 清除 broker 上 aruco/status 的 retained 消息
+            mosquitto_publish(g_mosq, nullptr, TOPIC_STATUS, 0, "", 1, true);
+        }
+        mosquitto_loop_stop(g_mosq, false);
+        mosquitto_disconnect(g_mosq);
+        mosquitto_destroy(g_mosq);
+        g_mosq = nullptr;
+        g_mqtt_connected.store(false);
+        rotating_logger->info("MQTT 连接已释放");
+    }
+    mosquitto_lib_cleanup();
+}
+//--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+
+std::atomic<bool> running(true);
+std::mutex exit_mutex;
+struct Item
+{
+    std::string label;
+    float confidence;
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    float angle; // 旋转角（弧度，顺时针正，[-π/4, 3π/4)），对应协议 rotation
+};
+
+// 定义轮廓点结构
+struct ContourPoint
+{
+    int x; // x坐标
+    int y; // y坐标
+};
+
+// 定义单个目标的轮廓信息
+struct ObjectContour
+{
+    int class_id;                     // 目标类别ID
+    std::string class_name;           // 目标类别名称
+    float confidence;                 // 置信度
+    std::vector<ContourPoint> points; // 轮廓点集
+};
+
+// 定义一帧图像的所有轮廓结果
+struct FrameContours
+{
+    std::string timestamp;               // 时间戳
+    std::vector<ObjectContour> contours; // 所有目标的轮廓
+    cv::Mat frame;                       // 处理后的图像帧
+    cv::Mat orgframe;                    // 处理前的图像帧
+    std::vector<Item> rect;
+};
+
+// 线程安全队列模板
+template <typename T>
+class SafeQueue
+{
+private:
+    std::queue<T> queue_;
+    mutable std::mutex mutex_;
+    std::condition_variable cond_;
+
+public:
+    SafeQueue() = default;
+    ~SafeQueue() = default;
+
+    void push(const T &item)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(item);
+        cond_.notify_one();
+    }
+
+    bool pop(T &item, int timeout_ms = -1)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (timeout_ms < 0)
+        {
+            cond_.wait(lock, [this]
+                       { return !queue_.empty() || !running; });
+        }
+        else
+        {
+            if (!cond_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                [this]
+                                { return !queue_.empty() || !running; }))
+            {
+                return false;
+            }
+        }
+
+        if (!running)
+            return false;
+
+        item = queue_.front();
+        queue_.pop();
+        return true;
+    }
+
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+    bool empty() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    // 添加清空队列的方法
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!queue_.empty())
+        {
+            queue_.pop();
+        }
+    }
+};
+
+// 定义两个队列用于线程间通信
+SafeQueue<FrameContours> contour_queue; // 检测线程 -> 消息处理线程
+// SafeQueue<cv::Mat> image_queue;         // 消息处理线程 -> ZMQ推送线程
+
+// 二次校准序列（在 ProcessDetection 线程执行，原 on_stop 逻辑迁移）
+void run_calibration_sequence()
+{
+    rotating_logger->info("收到 aruco/stop(calibrate)，开始二次校准");
+    publish_calib_status(1); // 1=纠偏中
+    sleep(6);
+    if (!running) return;
+
+    // ===== 临时硬编码（视频流未接，绕过取图直接纠偏）=====
+    // 收到 stop 后直接给固定纠偏值：X=100mm, Y=-120mm（Y 负 → flagy=false → 方向2）
+    // 恢复取图逻辑时把 TEMP_FORCE_CALIB 改为 false 即可。
+    const bool TEMP_FORCE_CALIB = true;
+    int dx = 0, dy = 0;
+    {
+        float _fdx = 0.f, _fdy = 0.f;
+        cv::Mat fail_bgr;
+        DepthDetectResult fail_res;
+        float cam_fx = 0.f, cam_fy = 0.f;
+        if (get_depth_offset(_fdx, _fdy, &fail_bgr, &fail_res, &cam_fx, &cam_fy)) {
+            dx = (int)std::lround(_fdx);
+            dy = (int)std::lround(_fdy);
+            rotating_logger->info("深度相机纠偏真值 dx={} dy={}", dx, dy);
+        } else if (fail_bgr.empty()) {
+            rotating_logger->error("深度相机检测失败且无帧，dx/dy 置 0");
+        } else {
+            // ===== 人工标注回流：存帧 → 通知遥控器 → 等标注 → 合并计算 =====
+#ifdef ENABLE_MANUAL_ANNOTATION
+            rotating_logger->error("深度相机检测失败(n={})，进入人工标注流程", fail_res.n_holes);
+            std::string png = manual_annotation::save_failure_frame(fail_bgr, "/home/cat/mv3d_out");
+            manual_annotation::prune_archive("/home/cat/mv3d_out", 20);   // 只保留最近 20 张归档帧
+            cv::imwrite("/home/cat/manual_flow/frame.png", fail_bgr);   // 同步给 8080 标注服务
+            std::string auto_json = "[";
+            for (size_t i = 0; i < fail_res.centers.size(); ++i) {
+                if (i) auto_json += ",";
+                char buf[64];
+                snprintf(buf, sizeof(buf), "[%.1f,%.1f,%.1f]",
+                         fail_res.centers[i].x, fail_res.centers[i].y, fail_res.radii[i]);
+                auto_json += buf;
+            }
+            auto_json += "]";
+            publish_manual_request("manual_" + std::to_string(now_ms()),
+                                   "http://192.168.144.118:8080/frame.png", auto_json, "holes<3");
+            std::vector<manual_annotation::ManualPoint> pts;
+            if (wait_manual_points(pts, 90)) {
+                cv::Point2f cen; float _dx = 0.f, _dy = 0.f; bool ok = false;
+                manual_annotation::merge_and_compute(fail_res, pts, cam_fx, cam_fy,
+                    fail_res.z, 784.4f, 559.1f, cen, _dx, _dy, ok);
+                if (ok) {
+                    dx = (int)std::lround(_dx);
+                    dy = (int)std::lround(_dy);
+                    rotating_logger->info("人工标注纠偏值 dx={} dy={}", dx, dy);
+                } else {
+                    rotating_logger->error("人工标注合并失败，dx/dy 置 0");
+                }
+            } else {
+                rotating_logger->error("人工标注超时(90s)，dx/dy 置 0");
+            }
+            // 标注流程结束（成功/超时）→ 删除服务用临时帧，避免下一次打开看到旧图；
+            // 归档帧 /home/cat/mv3d_out/manual_<ts>.png 保留（排查用）
+            std::remove("/home/cat/manual_flow/frame.png");
+#else
+            // 精简生产版：未编译人工标注模块，检测失败直接置 0（飞控心跳不停）
+            rotating_logger->error("深度相机检测失败(n={})，人工标注模块未启用，dx/dy 置 0",
+                                   fail_res.n_holes);
+            dx = 0; dy = 0;
+#endif
+        }
+    }
+
+    if (!TEMP_FORCE_CALIB)
+    {
+        contour_queue.clear();        // 丢弃校准前旧帧
+        flagimg1 = false;             // 强制等待一帧新保存
+        flagimg = true;               // 请求 Detect 线程保存当前帧到 gao.jpg
+        int waited = 0;
+        while (!flagimg1 && waited < 50) // 最长等 5s（原 sleep(3) 固定等待改为轮询）
+        {
+            usleep(100000);
+            ++waited;
+        }
+        if (!flagimg1)
+        {
+            rotating_logger->error("校准失败：未在限定时间内获取 gao.jpg");
+            publish_calib_status(0);
+            g_calib_req.store(false);
+            return;
+        }
+        cv::Mat calib_img = cv::imread(GAO_JPG, cv::IMREAD_COLOR);
+        flagimg1 = false;
+        if (calib_img.empty())
+        {
+            rotating_logger->error("校准失败：读取 gao.jpg 失败");
+            publish_calib_status(0);
+            g_calib_req.store(false);
+            return;
+        }
+
+        std::vector<cv::Point2i> holeCenters;
+        std::vector<int> holeRadii;
+        cv::Point2i midPixel = detectHoleCenters(calib_img, holeCenters, holeRadii);
+        if (midPixel.x == -1)
+        {
+            rotating_logger->error("校准失败：未检测到孔位");
+            publish_calib_status(0);
+            g_calib_req.store(false);
+            return;
+        }
+        dx = (int)((midPixel.x - 635) * 1.29);
+        dy = (int)((midPixel.y - 358) * 1.29);
+    }
+    else
+    {
+        rotating_logger->info("使用深度相机纠偏值 dx={} dy={}", dx, dy);
+    }
+
+    try
+    {
+        // 复位40秒
+        if (!controller.resetToCenter())
+        {
+            throw std::runtime_error("复位到中心位置失败");
+        }
+        // x轴和y轴移动
+        std::cout << "二次纠偏坐标：" << " (" << dx << "," << dy << ")" << std::endl;
+        // 恢复第一次(原始)的方向设置
+        bool flagx = (dx < 0);
+        bool flagy = (dy >= 0);
+        if (abs(dx) > 150) dx = 150; // 机械限幅 150mm
+        if (abs(dy) > 150) dy = 150;
+        if (!controller.moveX(abs(dx), flagx))
+        {
+            throw std::runtime_error("X轴移动失败");
+        }
+        if (!controller.moveY(abs(dy), flagy))
+        {
+            throw std::runtime_error("Y轴移动失败");
+        }
+        // 等待x轴和y轴移动
+        sleep(90);
+        if (!running) return;
+        // 移动到位：发布纠偏完成状态 2，等待 aruco/reset 指令（此时 complete 保持 0）
+        publish_calib_status(2); // 2=纠偏完成（移动到位）
+        rotating_logger->info("移动到位，等待 aruco/reset 指令...");
+        // 等待收到 aruco/reset 消息（on_mqtt_message 置 g_reset_req）
+        while (!g_reset_req.load() && running)
+        {
+            sleep(1);
+        }
+        if (!running) return;
+        g_reset_req.store(false);       // 消费 reset 请求
+        rotating_logger->info("收到 aruco/reset 指令，执行机械复位...");
+        if (!controller.resetToCenter())
+        {
+            throw std::runtime_error("复位到中心位置失败");
+        }
+        // 复位完成：complete=1 持续 10 秒（由状态线程每秒发布）
+        g_complete_remaining.store(10);
+        rotating_logger->info("复位完成，aruco/reset/complete=1 持续 10 秒");
+        rotating_logger->info("二次校准完成");
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "操作失败: " << e.what() << std::endl;
+        rotating_logger->error("二次校准操作失败");
+        publish_calib_status(0);
+    }
+    g_calib_req.store(false);
+}
+
+// 复位应答序列（收到 aruco/reset 后执行）：仅当校准状态=2 置 complete=1 持续 10 秒，不做机械动作
+void run_reset_sequence()
+{
+    if (g_calib_state.load() == 2)
+    {
+        g_complete_remaining.store(10);
+        rotating_logger->info("收到 aruco/reset(reset)，校准状态=2，aruco/reset/complete=1 持续 10 秒");
+    }
+    else
+    {
+        g_complete_remaining.store(0);
+        rotating_logger->warn("收到 aruco/reset(reset)，校准状态={}（非2），aruco/reset/complete 保持 0",
+                              g_calib_state.load());
+    }
+    g_reset_req.store(false);
+}
+
+/*-------------------------------------------
+                  Configuration
+-------------------------------------------*/
+std::string model_path;
+std::string stream_rtsp;
+
+// ============ 裸 ffmpeg 拉流（2026-09 取帧加固） ============
+// OpenCV 4.2 的 cv::VideoCapture 无读超时：视频源闪断后读阻塞会使程序僵死、停止推理。
+// 改用 ffmpeg 拉流：经 AVDictionary 设置 stimeout/timeout(微秒) 让 read 超时返回，
+// 并挂 interrupt 回调(基于 av_gettime_relative 单调时钟，不受系统时钟跳变影响)。
+// 这样 read() 最多阻塞约 timeout 毫秒即返回失败，配合读流 watchdog 触发重连，实现断流自愈。
+class FrameReader {
+public:
+    FrameReader() = default;
+    ~FrameReader() { close(); }
+
+    bool open(const std::string &url, int timeout_ms = 3000) {
+        close();
+        url_ = url; timeout_ms_ = timeout_ms;
+        synced_ = false;   // 每次(重)连接都从下一个关键帧重新对齐
+        AVDictionary *opts = nullptr;
+        av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+        // 只设置 stimeout（RTSP 套接字连接超时）。不要设置 "timeout"：
+        // ffmpeg 4.2.x 的 "timeout" 选项会走带 socket-timeout 的 IO 分支，在该分支里
+        // RTSP 会错误地 bind 到对端(摄像头)地址，导致 EADDRNOTAVAIL ->
+        // "Unable to open RTSP for listening / Cannot assign requested address"，流永远连不上。
+        // 读阻塞防护由下方 interrupt 回调(_interrupt_cb)保证，不依赖 "timeout"。
+        av_dict_set(&opts, "stimeout", std::to_string(timeout_ms * 1000).c_str(), 0);
+        if (avformat_open_input(&fmt_, url_.c_str(), nullptr, &opts) != 0) { av_dict_free(&opts); return false; }
+        av_dict_free(&opts);
+        last_activity_ms_ = now_ms();
+        fmt_->interrupt_callback.callback = &FrameReader::_interrupt_cb;
+        fmt_->interrupt_callback.opaque   = this;
+        if (avformat_find_stream_info(fmt_, nullptr) < 0) { close(); return false; }
+        // av_find_best_stream 的 decoder_ret 参数在 FFmpeg 4.x 是 AVCodec**（非 const）、
+        // FFmpeg 5.x 起改为 const AVCodec**。用条件编译匹配，避免 const 限定转换报错。
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+        const AVCodec *dec = nullptr;
+#else
+        AVCodec *dec = nullptr;
+#endif
+        video_stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
+        if (video_stream_ < 0 || !dec) { close(); return false; }
+        decoder_ = dec;
+        codec_ctx_ = avcodec_alloc_context3(decoder_);
+        if (!codec_ctx_) { close(); return false; }
+        if (avcodec_parameters_to_context(codec_ctx_, fmt_->streams[video_stream_]->codecpar) < 0) { close(); return false; }
+        if (avcodec_open2(codec_ctx_, decoder_, nullptr) < 0) { close(); return false; }
+        frame_ = av_frame_alloc();
+        pkt_   = av_packet_alloc();
+        if (!frame_ || !pkt_) { close(); return false; }
+        w_ = codec_ctx_->width; h_ = codec_ctx_->height;
+        sws_ = sws_getContext(codec_ctx_->width, codec_ctx_->height, codec_ctx_->pix_fmt,
+                              codec_ctx_->width, codec_ctx_->height, AV_PIX_FMT_BGR24,
+                              SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_) { close(); return false; }
+        return true;
+    }
+
+    bool is_open() const { return fmt_ != nullptr; }
+
+    bool read(cv::Mat &dst) {
+        if (!fmt_) return false;
+        // 绝对截止时间：本次 read 最多耗时 timeout_ms_ 毫秒，无论是否读到包/能否解出帧，超时即返回。
+        // 保证 read() 永不无限阻塞——解码器一直 EAGAIN 解不出帧、或源闪断卡在 av_read_frame，
+        // 都会被限界，配合外层读流 watchdog(READ_STALL_MS)触发重连实现自愈(用户约束：软失败继续运行)。
+        int64_t deadline = now_ms() + timeout_ms_;
+        while (now_ms() < deadline) {
+            int ret = av_read_frame(fmt_, pkt_);
+            if (ret < 0) {
+                if (ret == AVERROR(EAGAIN)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                return false;   // 超时(中断回调) / 流结束 / 错误
+            }
+            if (pkt_->stream_index != video_stream_) { av_packet_unref(pkt_); continue; }
+            last_activity_ms_ = now_ms();
+            // 关键帧对齐：拉流常从中途(非IDR)切入，若把切入前被 find_stream_info 越过的 IDR 之后
+            // 的 P/B 帧直接喂给解码器，会因找不到参考帧而一直 EAGAIN(HEVC 的 Could not find ref)。
+            // 故跳过首个 IDR 关键帧之前的所有帧，从关键帧开始喂，解码器即可正常输出。
+            if (!synced_) {
+                if (!(pkt_->flags & AV_PKT_FLAG_KEY)) { av_packet_unref(pkt_); continue; }
+                synced_ = true;
+            }
+            if (avcodec_send_packet(codec_ctx_, pkt_) < 0) { av_packet_unref(pkt_); return false; }
+            av_packet_unref(pkt_);
+            int rret = avcodec_receive_frame(codec_ctx_, frame_);
+            if (rret == 0) {
+                cv::Mat bgr(h_, w_, CV_8UC3);
+                uint8_t *d[4] = { bgr.data, nullptr, nullptr, nullptr };
+                int dl[4] = { (int)bgr.step, 0, 0, 0 };
+                sws_scale(sws_, frame_->data, frame_->linesize, 0, h_, d, dl);
+                dst = bgr;
+                return true;
+            } else if (rret == AVERROR(EAGAIN)) {
+                continue;   // 仍需更多包才能解出一帧
+            } else {
+                return false;
+            }
+        }
+        return false;   // 未在时限内解出一帧
+    }
+
+    void close() {
+        if (sws_) { sws_freeContext(sws_); sws_ = nullptr; }
+        if (pkt_) { av_packet_free(&pkt_); }
+        if (frame_) { av_frame_free(&frame_); }
+        if (codec_ctx_) { avcodec_free_context(&codec_ctx_); }
+        if (fmt_) { avformat_close_input(&fmt_); }
+        w_ = h_ = 0; video_stream_ = -1;
+    }
+
+private:
+    static int _interrupt_cb(void *opaque) {
+        FrameReader *self = static_cast<FrameReader*>(opaque);
+        uint64_t now = av_gettime_relative() / 1000;   // 单调时钟(ms)
+        return (now - self->last_activity_ms_ > (uint64_t)(self->timeout_ms_ + 2000)) ? 1 : 0;
+    }
+
+    AVFormatContext *fmt_ = nullptr;
+    AVCodecContext  *codec_ctx_ = nullptr;
+    const AVCodec   *decoder_ = nullptr;
+    AVFrame *frame_ = nullptr;
+    AVPacket *pkt_ = nullptr;
+    SwsContext *sws_ = nullptr;
+    int video_stream_ = -1, w_ = 0, h_ = 0;
+    int64_t last_activity_ms_ = 0;
+    int timeout_ms_ = 3000;
+    bool synced_ = false;   // 是否已对齐到首个关键帧，后续帧可直接喂解码器
+    std::string url_;
+};
+int stride;
+float threshold_mask;
+const int MAX_QUEUE_SIZE = 1; // 队列最大长度，防止内存溢出
+
+
+double __get_us(struct timeval t)
+{
+    return (t.tv_sec * 1000000 + t.tv_usec);
+}
+
+
+
+std::string base64_encode(const std::vector<unsigned char> &data)
+{
+    BIO *bio = BIO_new(BIO_s_mem());
+    BIO *b64 = BIO_new(BIO_f_base64());
+    bio = BIO_push(b64, bio);
+
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(b64, data.data(), data.size());
+    BIO_flush(b64);
+
+    char *buffer;
+    int length = BIO_get_mem_data(bio, &buffer);
+
+    std::string encoded_data(buffer, length);
+
+    BIO_free_all(b64);
+
+    return encoded_data;
+}
+
+std::string getTimeString()
+{
+    auto now = std::chrono::system_clock::now();
+    auto now_c = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&now_c), "%Y-%m-%d %H:%M:%S");
+    ss << std::setw(4) << std::setfill('0') << ms.count();
+    std::string time_str = ss.str();
+    time_str.replace(19, 1, "."); // 替换第20个字符为点
+    return time_str;
+}
+
+// 从ContourPoint转换为cv::Point
+std::vector<cv::Point> convert_to_cv_points(const std::vector<ContourPoint> &contour_points)
+{
+    std::vector<cv::Point> cv_points;
+    cv_points.reserve(contour_points.size());
+    for (const auto &pt : contour_points)
+    {
+        cv_points.emplace_back(pt.x, pt.y);
+    }
+    return cv_points;
+}
+
+// 拟合轮廓为圆，返回圆心和半径
+bool fit_contour_to_circle(const std::vector<ContourPoint> &contour, cv::Point2f &center, float &radius)
+{
+    if (contour.size() < 5)
+    { // 至少需要5个点才能拟合圆
+        return false;
+    }
+    // std::vector<ContourPoint> points
+    std::vector<cv::Point> points = convert_to_cv_points(contour);
+    cv::Mat points_mat(points);
+
+    // 使用最小二乘法拟合圆
+    cv::minEnclosingCircle(points_mat, center, radius);
+    return true;
+}
+
+// 计算两条线段的交点
+bool calculate_intersection(const cv::Point2f &p1, const cv::Point2f &p2,
+                            const cv::Point2f &p3, const cv::Point2f &p4,
+                            cv::Point2f &intersection)
+{
+    // 线段1: p1到p2，线段2: p3到p4
+    float x1 = p1.x, y1 = p1.y;
+    float x2 = p2.x, y2 = p2.y;
+    float x3 = p3.x, y3 = p3.y;
+    float x4 = p4.x, y4 = p4.y;
+
+    // 计算分母
+    float denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (std::abs(denom) < 1e-6)
+    {
+        return false; // 线段平行或重合，无交点
+    }
+
+    // 计算分子
+    float t_num = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4);
+    float u_num = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3));
+
+    float t = t_num / denom;
+    float u = u_num / denom;
+
+    // 检查交点是否在线段上
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1)
+    {
+        intersection.x = x1 + t * (x2 - x1);
+        intersection.y = y1 + t * (y2 - y1);
+        return true;
+    }
+
+    return false; // 交点在线段延长线上，不视为有效交点
+}
+
+// 生成带时间戳的文件名，避免重复
+std::string generateTimestampFilename(const std::string &prefix = "image", const std::string &ext = ".jpg")
+{
+    auto now = std::chrono::system_clock::now();
+    auto now_c = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << prefix << "_"
+       << std::put_time(std::localtime(&now_c), "%Y%m%d_%H%M%S")
+       << ext;
+    return ss.str();
+}
+
+// 计算容器中所有点的算术平均值（质心），作为距离和最小的近似点
+cv::Point2f calculateMeanPoint(const std::vector<cv::Point2f>& points) {
+    float sum_x = 0.0f, sum_y = 0.0f;
+    for (const auto& pt : points) {
+        sum_x += pt.x;
+        sum_y += pt.y;
+    }
+    int n = points.size();
+    return cv::Point2f(sum_x / n, sum_y / n);
+}
+
+// 消息处理线程函数
+// 校准状态/复位应答 1Hz 发布线程：主循环任意时刻（含校准序列 sleep(180) 期间）都保持每秒更新
+void status_publish_loop()
+{
+    while (g_status_run.load())
+    {
+        sleep(1);
+        // aruco/calibrate/status：1Hz；complete=1 窗口期间回 0（纠偏完成且复位已确认）
+        if (g_complete_remaining.load() > 0)
+        {
+            publish_calib_status(0);
+        }
+        else
+        {
+            publish_calib_status(g_calib_state.load());
+        }
+        // aruco/reset/complete：默认 0；复位完成后(g_complete_remaining>0)置 1 持续 10 秒再恢复 0
+        int remain = g_complete_remaining.load();
+        if (remain > 0)
+        {
+            publish_json(TOPIC_RESET_COMPLETE, json{{"status", 1}}, 1, false);
+            g_complete_remaining.store(remain - 1);
+        }
+        else
+        {
+            publish_json(TOPIC_RESET_COMPLETE, json{{"status", 0}}, 1, false);
+        }
+
+        // ---- MQTT 断线自愈 watchdog ----
+        // 背景：系统时钟跳变（如 RTC 停在 2024 被 ntpd 拨到 2026）会使 EMQX 按 wall clock
+        // 判定 keepalive 超时踢断所有连接，且 libmosquitto 自动重连偶发失效，导致"进程活但
+        // MQTT 全无消息"。这里每 1 秒检查一次，断开超 15 秒就用 steady_clock（不受时钟跳变
+        // 影响）判定时长，主动 mosquitto_reconnect 强制恢复；MQTT 不可用时软失败继续运行
+        int64_t now = now_ms();
+        if (g_mqtt_connected.load())
+        {
+            g_mqtt_last_seen.store(now);
+            if (g_mqtt_reconnect_fail.load() > 0) g_mqtt_reconnect_fail.store(0); // 已恢复，清零
+        }
+        else if (g_mosq != nullptr && (now - g_mqtt_last_seen.load()) > 15000 &&
+                 (now - g_mqtt_last_reconnect.load()) > 15000)
+        {
+            g_mqtt_last_reconnect.store(now);
+            int rc = mosquitto_reconnect(g_mosq);
+            if (rc == MOSQ_ERR_SUCCESS || rc == MOSQ_ERR_CONN_PENDING)
+            {
+                g_mqtt_reconnect_fail.store(0);
+                rotating_logger->info("MQTT watchdog: 断开>15s 主动重连已发起 rc={}", rc);
+                std::cerr << "[MQTT] watchdog: 断开>15s 主动重连 rc=" << rc << std::endl;
+            }
+            else
+            {
+                // 不主动退出：MQTT 不可用时软失败继续运行（用户约束：不崩溃），
+                // 交由 libmosquitto 后台持续重连，broker 恢复后自动上线。
+                rotating_logger->warn("MQTT watchdog: 主动重连失败 rc={}，继续后台重连", rc);
+                std::cerr << "[MQTT] watchdog: 主动重连失败 rc=" << rc << "，继续后台重连" << std::endl;
+            }
+        }
+    }
+}
+
+void ProcessDetection()
+{
+    rotating_logger->info("消息处理线程启动");
+    // 初始化MQTT（失败不退出，跳过MQTT功能继续运行）
+    if (!init_mqtt())
+    {
+        rotating_logger->warn("MQTT初始化失败，跳过MQTT功能继续运行");
+        std::cout << "[WARN] MQTT不可用，将以无MQTT模式继续运行" << std::endl;
+    }
+    
+    std::vector<cv::Point2f> intersections; // MQTT推送的点
+    FrameContours data;
+    // 启动校准状态 1Hz 发布线程（独立于主循环，校准 sleep 期间也能持续发）
+    g_status_run.store(true);
+    g_status_thread = std::thread(status_publish_loop);
+    while (running)
+    {
+        // 处理 MQTT 指令（校准异步执行，不阻塞主循环；用原子 busy 标志而非 thread::joinable()，
+        // 因为线程函数跑完后 joinable() 仍为 true，会导致后续校准/复位永不响应）
+        if (g_calib_req.load() && !g_calib_busy.load())
+        {
+            g_calib_busy.store(true); // 先置位再启动，避免与下一轮循环竞态
+            rotating_logger->info("启动校准线程（异步执行）");
+            std::thread([]() {
+                run_calibration_sequence();
+                g_calib_busy.store(false);
+            }).detach();
+        }
+        // 校准线程运行期间，aruco/reset 由该线程自行消费（等待复位指令），主循环不抢占
+        if (g_reset_req.load() && !g_calib_busy.load())
+        {
+            run_reset_sequence();
+        }
+        // 构造 30Hz 恒定发布：有检测目标发真实纠偏值，无检测目标发 0（安全冗余）
+        bool detected = false;
+        float dx = 0.0f, dy = 0.0f, rotation = 0.0f;
+        if (flagimg1)
+        {
+            std::string timestampPath1 = "/home/cat/Flght_con/flght_control/saved_images/gao.jpg";
+            if (!std::filesystem::exists(timestampPath1))
+            {
+                rotating_logger->error("图片文件不存在: {}", timestampPath1);
+                std::cout << "图片文件不存在" << std::endl;
+                return;
+            }
+            frame2 = cv::imread(timestampPath1, cv::IMREAD_COLOR);
+            flagimg1 = false;
+        }
+
+        // 非阻塞取最新检测帧
+        if (contour_queue.pop(data, 0))
+        {
+            const float dk1 = 0.05f;
+            const float dk2 = 0.15f;
+            float x = 0.0; // 纵向偏移（相对基准 310）
+            float y = 0.0; // 横向偏移（相对基准 640）
+
+            // ===== 第一步：分离 rect 与 hole，并去重 hole（重叠时保留置信度大的）=====
+            const Item *the_rect = nullptr;
+            std::vector<const Item *> holes;
+            for (const auto &r : data.rect)
+            {
+                if (r.label == "rect")
+                {
+                    if (the_rect == nullptr || r.confidence > the_rect->confidence)
+                        the_rect = &r;
+                }
+                else if (r.label == "hole")
+                {
+                    holes.push_back(&r);
+                }
+            }
+
+            // hole 去重叠：两两中心距离过近（视为同一物理孔被重复检出）时，保留置信度大者
+            if (holes.size() > 1)
+            {
+                std::vector<const Item *> dedup;
+                for (const Item *h : holes)
+                {
+                    bool merged = false;
+                    for (const Item *&keep : dedup)
+                    {
+                        float cx1 = (h->x1 + h->x2) / 2, cy1 = (h->y1 + h->y2) / 2;
+                        float cx2 = (keep->x1 + keep->x2) / 2, cy2 = (keep->y1 + keep->y2) / 2;
+                        float dxc = cx1 - cx2, dyc = cy1 - cy2;
+                        // 距离小于两者尺寸均值（粗略重叠阈值）视为同一孔
+                        float sz = std::max((h->x2 - h->x1), (keep->x2 - keep->x1));
+                        if (std::hypot(dxc, dyc) < sz * 0.6f)
+                        {
+                            if (h->confidence > keep->confidence)
+                                keep = h; // 保留置信度大者
+                            merged = true;
+                            break;
+                        }
+                    }
+                    if (!merged)
+                        dedup.push_back(h);
+                }
+                holes = std::move(dedup);
+            }
+
+            // ===== 第二步：取"最上面"的孔（按中心纵坐标升序），最多 4 个 =====
+            std::sort(holes.begin(), holes.end(), [](const Item *a, const Item *b) {
+                return ((a->y1 + a->y2) / 2) < ((b->y1 + b->y2) / 2);
+            });
+            const size_t HOLE_MAX = 4;
+            std::vector<cv::Point2f> top_centers;
+            for (size_t i = 0; i < holes.size() && i < HOLE_MAX; ++i)
+            {
+                top_centers.push_back(cv::Point2f(
+                    (holes[i]->x1 + holes[i]->x2) / 2,
+                    (holes[i]->y1 + holes[i]->y2) / 2));
+            }
+
+            // ===== 第三步：rotation 用 rect；dx/dy 用最上面孔中心的质心 =====
+            // 诊断日志：每 10 帧打印一次，确认 hole 检出数量与选中的孔
+            {
+                static int dbg_count = 0;
+                if (++dbg_count % 10 == 0)
+                {
+                    std::string hc;
+                    for (auto &p : top_centers) hc += "(" + std::to_string(p.x) + "," + std::to_string(p.y) + ") ";
+                    rotating_logger->info("检测结果 rect={} hole={} top_hole={} 选中孔=[{}]",
+                                          the_rect ? "Y" : "N", holes.size(), top_centers.size(), hc);
+                }
+            }
+            // 有效落点需同时满足：检测到 rect + 至少 3 个孔（缺孔用 3 个连线）
+            if (the_rect != nullptr && top_centers.size() >= 3)
+            {
+                detected = true;
+                // 逐步收敛（2026-11-11）：rotation 限幅 ±10° + 死区 1°
+                // 飞控 yaw_rate_sp = 0.8*rotation（角速度），限幅后角速度≤8°/s，避免过冲；
+                // 真实偏角减小 -> rotation 减小 -> 角速度减小，逐步收敛；<1° 报 0（只滤噪声，保留 1~3° 继续纠正）。
+                {
+                // rotation 来源（2026-11-13 排查定案）：改用"四孔 PCA 主轴角"
+                // 实测：YOLO rect 角 29.1~29.8°，而短边几何 27.2°/PCA 26.5° 两法一致 -> rect 多报 2.3~2.6°，
+                //       导致飞控按 29.5° 转、真实只需 27.2°，表现为"转多"。
+                // PCA 对四孔顺序不敏感（大角度成菱形时仍稳定），4 孔不足时回退 rect 角度。
+                {
+                    const float ROT_MAX  = 30.0f * 3.14159265f / 180.0f;
+                    const float ROT_DEAD = 3.0f  * 3.14159265f / 180.0f;
+                    auto wrap45 = [](float a) -> float {          // 折算到 (-45°,+45°]
+                        const float Q = 0.7853981634f, H = 1.5707963268f;
+                        float r = fmodf(a + Q, H);
+                        if (r < 0.0f) r += H;
+                        if (r <= 1e-6f) r = H;
+                        return r - Q;
+                    };
+                    const float rect_rot = min_straighten_angle(the_rect->angle);
+                    float rot = rect_rot;
+                    if (top_centers.size() >= 4)
+                    {
+                        float cx = 0.f, cy = 0.f;
+                        for (auto &p : top_centers) { cx += p.x; cy += p.y; }
+                        cx /= (float)top_centers.size(); cy /= (float)top_centers.size();
+                        float sxx = 0.f, syy = 0.f, sxy = 0.f;
+                        for (auto &p : top_centers) {
+                            float dx = p.x - cx, dy = p.y - cy;
+                            sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+                        }
+                        rot = wrap45(0.5f * atan2f(2.0f * sxy, sxx - syy));   // PCA 主轴
+                    }
+                    if (fabsf(rot) < ROT_DEAD)      rot = 0.0f;
+                    else if (rot >  ROT_MAX)        rot =  ROT_MAX;
+                    else if (rot < -ROT_MAX)        rot = -ROT_MAX;
+                    rotation = rot;
+
+                    static int acount = 0;
+                    if (++acount % 10 == 0)
+                        rotating_logger->info("角度对比 rect_deg={:.2f} pca4_deg={:.2f} send_deg={:.2f}",
+                                              rect_rot * 57.2957795f,
+                                              (top_centers.size() >= 4 ? rot : 0.f) * 57.2957795f,
+                                              rotation * 57.2957795f);
+                }
+                }
+
+                cv::Point2f aim = calculateMeanPoint(top_centers); // 到各孔中心距离最短的点 = 质心
+                er_center = aim;
+                y = aim.x - 640; // 横向偏移（图像宽度中心 = 1280/2）
+                x = aim.y - 360; // 纵向偏移（基准 360 = 图像中心，2026-11-10 定）
+
+                // 横向 dy：三档阈值
+                bool dyMid = false, dxMid = false;
+                if (abs(y) <= 10)                   dy = 0.01;
+                else if (abs(y) <= 50)              { dy = (y >= 0 ? dk1 : -dk1); dyMid = true; }
+                else if (abs(y) <= 400)             dy = (y >= 0 ? dk2 : -dk2);
+                else                                dy = 0.01;
+
+                // 纵向 dx：三档阈值（符号与横向相反，图像上偏为正）
+                if (abs(x) <= 10)                   dx = 0.01;
+                else if (abs(x) <= 50)              { dx = (x >= 0 ? -dk1 : dk1); dxMid = true; }
+                else if (abs(x) <= 400)             dx = (x >= 0 ? -dk2 : dk2);
+                else                                dx = 0.01;
+
+                // ===== 补偿（2026-11-10）：落在 0.05 档(±5cm)的那一轴 ×1.11 =====
+                // 触发：|dx| 或 |dy| 为 0.05（10~50px 档）；只乘出现 0.05 的那一轴；
+                // 效果：0.05→0.056m，使 0.05²+0.02²=29cm² 补偿到 ≈36cm²（距离 ×√1.24≈1.11）
+                // 发送的是补偿后的米值（不再固定 0.05）
+                const float COMP_K = 1.11f;
+                if (dyMid) dy *= COMP_K;
+                if (dxMid) dx *= COMP_K;
+            }
+        }
+        contour_queue.clear();
+
+        // 恒定 30Hz 发布：有检测发真实值，无检测发 0（valid=false, dx=0, dy=0）
+        publish_detection(detected, dx, dy, rotation);
+        usleep(30000); // 30Hz 周期（约 33ms）
+    }
+    // 先停状态发布线程，再释放MQTT资源（避免线程在 mosquitto 销毁后仍发布）
+    g_status_run.store(false);
+    if (g_status_thread.joinable())
+    {
+        g_status_thread.join();
+    }
+    // 释放MQTT资源
+    cleanup_mqtt();
+    rotating_logger->info("消息处理线程退出");
+}
+
+
+
+// 检测线程函数
+void Detect()
+{
+    rotating_logger->info("检测线程启动");
+
+    // 颜色配置
+    const unsigned char class_colors[][3] = {
+        {255, 56, 56}, {255, 157, 151}, {255, 112, 31}, {255, 178, 29}, {207, 210, 49}, {72, 249, 10}, {146, 204, 23}, {61, 219, 134}, {26, 147, 52}, {0, 212, 187}, {44, 153, 168}, {0, 194, 255}, {52, 69, 147}, {100, 115, 255}, {0, 24, 236}, {132, 56, 255}, {82, 0, 133}, {203, 56, 255}, {255, 149, 200}, {255, 55, 199}};
+    const int COLOR_COUNT = sizeof(class_colors) / sizeof(class_colors[0]);
+    const int MAX_COUNT = 10000;
+
+    // 变量初始化
+    int ret = 0;
+    cv::Mat image, frame;
+    struct timeval start_time, stop_time;
+    rknn_app_context_t rknn_app_ctx = {0};
+    image_buffer_t src_image = {0};
+    object_detect_result_list od_results;
+
+    // 模型初始化
+    init_post_process();
+    ret = init_yolov8_seg_model(model_path.c_str(), &rknn_app_ctx);
+    if (ret != 0)
+    {
+        std::cerr << "初始化模型失败! ret=" << ret << ", 模型路径: " << model_path << std::endl;
+        rotating_logger->error("初始化模型失败! ret={}, 模型路径: {}", ret, model_path);
+        return;
+    }
+
+    // 视频流捕获（裸 ffmpeg，read 带读超时，源闪断可自愈）
+    FrameReader vr;
+    int count = 0;
+    int empty_frame_count = 0;   // 连续空帧计数（空帧送推理会触发 RGA 0x0 报错刷屏）
+    // —— 读流 watchdog（2026-09 加固）：视频源闪断后 cap.read() 可能阻塞或持续失败，导致程序僵死不再推理。
+    //    用单调时钟(now_ms，时钟跳变不影响)追踪最后读到有效帧的时刻；超过阈值即判停滞，释放视频流触发重连，
+    //    让程序在源恢复后自愈（用户约束：不崩溃、软失败继续运行）。
+    int64_t last_frame_ms = now_ms();     // 最后读到有效帧的时刻
+    const int64_t READ_STALL_MS = 8000;   // 超过无有效帧即判停滞阈值(ms)
+    int64_t last_video_reconnect = now_ms(); // 上次释放重连时刻，限制重连频率
+
+    while (running)
+    {
+        // 确保视频流连接
+        if (!vr.is_open())
+        {
+            rotating_logger->info("尝试连接视频流: {}", stream_rtsp);
+            if (!vr.open(stream_rtsp, 3000))
+            {
+                rotating_logger->error("视频流打开失败，5秒后重试");
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
+            }
+            rotating_logger->info("视频流连接成功");
+            count = 0;
+        }
+
+        // 读流 watchdog：超过阈值无有效帧（read 超时/失败返回后回到循环顶部即判定），释放视频流触发重连
+        if (now_ms() - last_frame_ms > READ_STALL_MS && now_ms() - last_video_reconnect > 3000)
+        {
+            rotating_logger->warn("读流停滞(>{}ms无有效帧)，释放视频流触发重连", READ_STALL_MS);
+            std::cerr << "[video] 读流停滞，释放重连" << std::endl;
+            vr.close();
+            empty_frame_count = 0;
+            last_video_reconnect = now_ms();
+            continue;
+        }
+
+        // 读取视频帧
+        if (vr.read(frame))
+        {
+            // 空帧/坏帧防护：跳过推理，避免 RGA 以 0x0 尺寸调用报错刷屏；连续空帧过多则释放重连
+            if (frame.empty())
+            {
+                ++empty_frame_count;
+                if (empty_frame_count == 1 || empty_frame_count % 50 == 0)
+                    rotating_logger->warn("收到空帧(第{}次)，跳过推理", empty_frame_count);
+                if (empty_frame_count >= 150)   // 连续空帧约 150 次（数秒）说明视频流异常，重连
+                {
+                    rotating_logger->warn("连续空帧过多({})，释放视频流触发重连", empty_frame_count);
+                    vr.close();
+                    empty_frame_count = 0;
+                }
+                continue;
+            }
+            empty_frame_count = 0;
+            last_frame_ms = now_ms();   // 读到有效帧，刷新读流 watchdog
+            ++count;
+            if (count % stride == 0)
+            {
+                gettimeofday(&start_time, nullptr);
+                // 保存图片
+                cv::Mat orgframe = frame.clone();
+                // 新增：连接成功后，强制读取一帧赋值给frame2，确保首次有值
+                if (flagimg)
+                {
+                    std::string timestampPath = "/home/cat/Flght_con/flght_control/saved_images/gao.jpg";
+                    bool success = cv::imwrite(timestampPath, orgframe);
+                    rotating_logger->info("视频流连接成功，frame2完成首次赋值"); 
+                    flagimg = false;
+                    flagimg1 = true;
+                }
+                
+                // 图像处理与模型推理
+                cv::cvtColor(frame, image, cv::COLOR_BGR2RGB);
+                src_image.width = image.cols;
+                src_image.height = image.rows;
+                src_image.format = IMAGE_FORMAT_RGB888;
+                src_image.virt_addr = image.data;
+                ret = inference_yolov8_seg_model(&rknn_app_ctx, &src_image, &od_results);
+                if (ret != 0)
+                {
+                    rotating_logger->error("模型推理失败，ret={}", ret);
+                    continue;
+                }
+                // 绘制检测框与信息
+                char text[256];
+                std::vector<Item> item_container;
+                for (int i = 0; i < od_results.count; i++)
+                {
+                    const object_detect_result &det_result = od_results.results[i];
+                    const char *cls_name = coco_cls_to_name(det_result.cls_id);
+                    // 转换为std::string后比较
+                    std::string cls_name_str = (cls_name == nullptr) ? "" : cls_name;
+                    if (cls_name_str == "rect") {
+                        // 字符串内容是"rect"，执行逻辑
+                        // cout << "类别名称是rect" << endl;
+                        rotating_logger->debug("{} @ ({}, {}, {}, {}) {:.3f}",
+                                           cls_name, det_result.box.left, det_result.box.top,
+                                           det_result.box.right, det_result.box.bottom, det_result.prop);
+                
+                    }
+                    // if (cls_name =="rect") 
+                    // {
+                    //     rect_flag = true; 
+                    //     std::cout << cls_name << " @ ("
+                    //           << det_result.box.left << ", "
+                    //           << det_result.box.top << ", "
+                    //           << det_result.box.right << ", "
+                    //           << det_result.box.bottom << ") "
+                    //           << std::fixed << std::setprecision(3) << det_result.prop
+                    //           << std::endl;
+                    // }
+                    
+                    
+                    const cv::Point pt1(det_result.box.left, det_result.box.top);
+                    const cv::Point pt2(det_result.box.right, det_result.box.bottom);
+
+                    // 绘制旋转框（OBB 4 角点）
+                    const float *crn = det_result.corners;
+                    std::vector<cv::Point> rot_pts;
+                    for (int c = 0; c < 4; c++)
+                        rot_pts.push_back(cv::Point((int)crn[2 * c], (int)crn[2 * c + 1]));
+                    cv::polylines(frame, rot_pts, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+                    snprintf(text, sizeof(text), "%s %.1f%%", cls_name, det_result.prop * 100);
+                    cv::putText(frame, text, pt1 + cv::Point(0, -6), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+                    
+                    item_container.push_back({cls_name, det_result.prop, det_result.box.left, det_result.box.top, det_result.box.right, det_result.box.bottom, det_result.angle});
+                }
+
+                // 绘制时间信息
+                const std::string currentTime = getTimeString();
+                cv::putText(frame, currentTime, cv::Point(1400, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 0), 2);
+
+                // 计算推理时间
+                gettimeofday(&stop_time, nullptr);
+                const float t = (__get_us(stop_time) - __get_us(start_time)) / 1000.0f;
+                if (count % (10) == 0)
+                { // 每10帧打印一次
+                    rotating_logger->info("推理时间: {:.6f} ms, FPS: {:.2f}", t, 1000.0f / t);
+                }
+
+                // 可以像保存检测框一样存入队列
+                if (contour_queue.size() < MAX_QUEUE_SIZE)
+                {
+                    // 将当前帧的所有轮廓保存到队列或其他存储
+                    FrameContours result;
+                    result.timestamp = currentTime;
+                    result.frame = frame.clone();
+                    result.orgframe = orgframe.clone();
+                    result.rect = item_container;
+                    contour_queue.push(result);
+                }
+                else
+                {
+                    rotating_logger->warn("检测队列已满，丢弃当前帧");
+                }
+
+                if (count >= MAX_COUNT)
+                    count = 0;
+            }
+        }
+        else
+        {
+            rotating_logger->error("网络异常，无法获取视频帧，重新连接...");
+            vr.close();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+
+    // 释放资源
+    release_yolov8_seg_model(&rknn_app_ctx);
+    vr.close();
+    rotating_logger->info("检测线程已退出，资源已释放");
+}
+
+// 信号处理函数，用于优雅退出
+void signal_handler(int signum)
+{
+    rotating_logger->info("收到退出信号: {}", signum);
+    running = false;
+}
+
+/*-------------------------------------------
+                  Main Function
+-------------------------------------------*/
+int main(int argc, char **argv)
+{
+    try
+    {
+        // 初始化日志
+        spdlog::set_level(spdlog::level::debug);
+        rotating_logger->set_level(spdlog::level::debug);
+        // 实时刷盘：warn 及以上立即写盘；debug/info 每 1 秒定期写盘（避免缓冲积压导致故障时日志不可见）
+        rotating_logger->flush_on(spdlog::level::warn);
+        spdlog::flush_every(std::chrono::seconds(1));
+
+        // 注册信号处理
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+
+        // 读取配置文件
+        std::ifstream config_file("/home/cat/Flght_con/flght_control/config.json");
+        if (!config_file.is_open())
+        {
+            std::cerr << "Could not open config.json file!" << std::endl;
+            rotating_logger->error(u8"无法打开配置文件: /home/cat/Flght_con/flght_control/config.json");
+            return 1;
+        }
+
+        json config;
+        try
+        {
+            config_file >> config;
+        }
+        catch (const nlohmann::json::parse_error &ex)
+        {
+            std::cerr << "JSON解析错误（语法）: " << ex.what() << "，行号: " << ex.byte << std::endl;
+            rotating_logger->error(u8"JSON解析错误（语法）: {}，行号: {}", ex.what(), ex.byte);
+            return 1;
+        }
+
+        try
+        {
+            model_path = config.at("model_path");
+            stream_rtsp = config.at("stream_rtsp"); // rtsp://192.168.144.25:8554/main.264
+            stride = config.at("stride");
+            threshold_mask = config.at("threshold_mask");
+        }
+        catch (const nlohmann::json::out_of_range &ex)
+        {
+            std::cerr << "JSON配置缺失键: " << ex.what() << std::endl;
+            rotating_logger->error(u8"JSON配置缺失键: {}", ex.what());
+            return 1;
+        }
+        catch (const nlohmann::json::type_error &ex)
+        {
+            std::cerr << "JSON类型错误: " << ex.what() << std::endl;
+            rotating_logger->error(u8"JSON类型错误: {}", ex.what());
+            return 1;
+        }
+
+        // 读取 MQTT 配置（键缺失使用默认值，不抛异常）
+        json mqtt_cfg = config.value("mqtt", json::object());
+        g_mqtt_host      = mqtt_cfg.value("host", "127.0.0.1");
+        g_mqtt_port      = mqtt_cfg.value("port", 1883);
+        g_mqtt_client_id = mqtt_cfg.value("client_id", "drone-controller");
+        rotating_logger->info("MQTT 配置 host={}:{} client_id={}", g_mqtt_host, g_mqtt_port, g_mqtt_client_id);
+
+        rotating_logger->info(u8"算法启动");
+
+        // 创建并启动三个线程
+        std::thread detect_thread(Detect);
+        std::thread process_thread(ProcessDetection);
+        // std::thread zmq_thread(ZmqPushImage);
+
+        // 等待线程结束
+        detect_thread.join();
+        process_thread.join();
+        // zmq_thread.join();
+
+        rotating_logger->info(u8"程序正常退出");
+    }
+    catch (const spdlog::spdlog_ex &ex)
+    {
+        std::cerr << "Log initialization failed: " << ex.what() << std::endl;
+        return 1;
+    }
+    catch (const std::exception &ex)
+    {
+        std::cerr << "程序异常: " << ex.what() << std::endl;
+        rotating_logger->error(u8"程序异常: {}", ex.what());
+        return 1;
+    }
+
+    return 0;
+}
