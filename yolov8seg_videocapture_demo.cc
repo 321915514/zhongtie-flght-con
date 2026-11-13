@@ -392,6 +392,8 @@ public:
 struct mosquitto *g_mosq = nullptr;                // MQTT 客户端句柄
 std::atomic<bool> g_mqtt_connected{false};         // MQTT 连接状态（on_connect/on_disconnect 维护）
 std::atomic<uint16_t> g_msgid{0};                  // detection msgid 自增，>65535 回绕 0
+std::atomic<long long> g_last_detect_ms{0};        // 最近一次拿到检测结果的时刻（诊断：判断推理是否还在产出）
+std::atomic<long long> g_last_valid_ms{0};         // 最近一次 valid=1 的时刻（诊断：判断是否还在对齐）
 std::atomic<bool> g_calib_req{false};              // aruco/stop → 二次校准请求
 std::atomic<bool> g_reset_req{false};              // aruco/reset → 复位应答请求
 std::atomic<int> g_calib_state{0};                 // 当前校准状态：0=未纠偏 1=纠偏中 2=纠偏完成
@@ -633,7 +635,15 @@ bool publish_json(const char *topic, const json &payload, int qos, bool retain)
 // 发布降落纠偏值（aruco/detection，QoS0），msgid 自增
 void publish_detection(bool valid, float dx, float dy, float rotation)
 {
-    if (g_mosq == nullptr || !g_mqtt_connected.load()) return;
+    static int down_cnt = 0;
+    if (g_mosq == nullptr || !g_mqtt_connected.load())
+    {
+        if (++down_cnt % 150 == 0)
+            rotating_logger->warn("detection 未发布: MQTT {}",
+                                  g_mosq == nullptr ? "未初始化" : "未连接");
+        return;
+    }
+    down_cnt = 0;
     uint16_t mid = (uint16_t)(g_msgid.load() + 1); // 自增，>65535 回绕 0
     g_msgid.store(mid);
     json j = {
@@ -644,7 +654,26 @@ void publish_detection(bool valid, float dx, float dy, float rotation)
         {"dz", 1.0},                   // 协议固定默认值，飞控自行控制下降
         {"rotation", round4(rotation)}
     };
-    publish_json(TOPIC_DETECTION, j, 0, false);
+    if (!publish_json(TOPIC_DETECTION, j, 0, false))
+    {
+        // 诊断（2026-11-13）：带上值一起记，便于判断是"算错"还是"没发出去"
+        static int fail_cnt = 0;
+        if (++fail_cnt % 30 == 0)
+            rotating_logger->warn("detection 发布失败 msgid={} valid={} dx={:.4f}m dy={:.4f}m rot={:+.2f}°",
+                                  mid, valid, dx, dy, rotation * 57.2957795f);
+    }
+    else
+    {
+        // 心跳：约 10 秒一条，确认还在发；同时报"最近一次 valid=1 距今多久"
+        static int ok_cnt = 0;
+        if (++ok_cnt % 300 == 0)
+        {
+            long long lv = g_last_valid_ms.load();
+            rotating_logger->info("detection 心跳 msgid={} 最近一次 valid=1 {}",
+                                  mid, lv > 0 ? std::to_string((long long)(now_ms() - lv)) + "ms 前"
+                                              : std::string("从未(未对齐过)"));
+        }
+    }
 }
 
 // 发布二次校准状态（aruco/calibrate/status，QoS1）
@@ -652,6 +681,17 @@ void publish_calib_status(int status)
 {
     g_calib_state.store(status);                    // 同步本地校准状态（aruco/reset 判断用）
     publish_json(TOPIC_CALIB_STATUS, json{{"status", status}}, 1, false);
+}
+
+// 2026-11-13: 二次校准（遥控器发 aruco/stop{cmd:calibrate} 触发）检测到的 dx/dy 一并回发，
+// 遥控器据此在结果区显示「自动校准 dx/dy」；status=0+reason 时提示「自动校准失败，需手动」。
+// 只走校准通道(aruco/calibrate/status)，不碰 aruco/detection(降落 30Hz) 与飞控链路。
+void publish_calib_status_xy(int status, int dx, int dy, const char *reason = nullptr)
+{
+    g_calib_state.store(status);
+    json j{{"status", status}, {"dx", dx}, {"dy", dy}};
+    if (reason != nullptr && reason[0] != ' ') j["reason"] = reason;
+    publish_json(TOPIC_CALIB_STATUS, j, 1, false);
 }
 
 #ifdef ENABLE_MANUAL_ANNOTATION
@@ -1006,10 +1046,14 @@ void run_calibration_sequence()
                 auto_json += buf;
             }
             auto_json += "]";
-            publish_manual_request("manual_" + std::to_string(now_ms()),
+            std::string img_id = "manual_" + std::to_string(now_ms());
+            publish_manual_request(img_id,
                                    "http://192.168.144.118:8080/frame.png", auto_json, "holes<3");
+            rotating_logger->info("人工标注请求已发出 image_id={} 自动孔={} 原因=holes<3，等遥控器回传(最长 90s)",
+                                  img_id, auto_json);
             std::vector<manual_annotation::ManualPoint> pts;
             if (wait_manual_points(pts, 90)) {
+                rotating_logger->info("收到人工标注 {} 点", pts.size());
                 cv::Point2f cen; float _dx = 0.f, _dy = 0.f; bool ok = false;
                 manual_annotation::merge_and_compute(fail_res, pts, cam_fx, cam_fy,
                     fail_res.z, 784.4f, 559.1f, cen, _dx, _dy, ok);
@@ -1035,6 +1079,14 @@ void run_calibration_sequence()
         }
     }
 
+    // 诊断（2026-11-13）：二次校准全流程留痕，现场看日志即可判断卡在哪一步
+    const auto t_cal0 = std::chrono::steady_clock::now();
+    rotating_logger->info("二次校准开始 状态={} 模式={} 深度相机真值 dx={}mm dy={}mm",
+                          g_calib_state.load(),
+                          TEMP_FORCE_CALIB ? "TEMP_FORCE_CALIB(直接用深度相机值,跳过 gao.jpg/人工标注)" : "gao.jpg 自动识别+人工回流",
+                          dx, dy);
+    // 检测值回传（status=1 纠偏中 + dx/dy），遥控器显示「自动校准 dx/dy」
+    publish_calib_status_xy(1, dx, dy);
     if (!TEMP_FORCE_CALIB)
     {
         contour_queue.clear();        // 丢弃校准前旧帧
@@ -1049,7 +1101,7 @@ void run_calibration_sequence()
         if (!flagimg1)
         {
             rotating_logger->error("校准失败：未在限定时间内获取 gao.jpg");
-            publish_calib_status(0);
+            publish_calib_status_xy(0, 0, 0, "未在限定时间内获取图像");
             g_calib_req.store(false);
             return;
         }
@@ -1058,7 +1110,7 @@ void run_calibration_sequence()
         if (calib_img.empty())
         {
             rotating_logger->error("校准失败：读取 gao.jpg 失败");
-            publish_calib_status(0);
+            publish_calib_status_xy(0, 0, 0, "读取校准图像失败");
             g_calib_req.store(false);
             return;
         }
@@ -1069,12 +1121,14 @@ void run_calibration_sequence()
         if (midPixel.x == -1)
         {
             rotating_logger->error("校准失败：未检测到孔位");
-            publish_calib_status(0);
+            publish_calib_status_xy(0, 0, 0, "未检测到孔位");
             g_calib_req.store(false);
             return;
         }
         dx = (int)((midPixel.x - 635) * 1.29);
         dy = (int)((midPixel.y - 358) * 1.29);
+        rotating_logger->info("gao.jpg 孔位检出 n={} 中心=({},{})px → dx={}mm dy={}mm",
+                              (int)holeCenters.size(), midPixel.x, midPixel.y, dx, dy);
     }
     else
     {
@@ -1083,11 +1137,13 @@ void run_calibration_sequence()
 
     try
     {
+        rotating_logger->info("二次校准: 开始机械复位(40s 级)");
         // 复位40秒
         if (!controller.resetToCenter())
         {
             throw std::runtime_error("复位到中心位置失败");
         }
+        rotating_logger->info("二次校准: 复位完成，原始目标 dx={}mm dy={}mm", dx, dy);
         // x轴和y轴移动
         std::cout << "二次纠偏坐标：" << " (" << dx << "," << dy << ")" << std::endl;
         // 恢复第一次(原始)的方向设置
@@ -1095,19 +1151,29 @@ void run_calibration_sequence()
         bool flagy = (dy >= 0);
         if (abs(dx) > 150) dx = 150; // 机械限幅 150mm
         if (abs(dy) > 150) dy = 150;
+        rotating_logger->info("二次校准: 移动参数 |dx|={}mm |dy|={}mm 方向 x={} y={}（限幅 150mm）",
+                              abs(dx), abs(dy), flagx ? "负" : "正", flagy ? "正" : "负");
+        const auto t_move0 = std::chrono::steady_clock::now();
         if (!controller.moveX(abs(dx), flagx))
         {
             throw std::runtime_error("X轴移动失败");
         }
+        rotating_logger->info("二次校准: X 轴移动已下发 |dx|={}mm", abs(dx));
         if (!controller.moveY(abs(dy), flagy))
         {
             throw std::runtime_error("Y轴移动失败");
         }
+        rotating_logger->info("二次校准: Y 轴移动已下发 |dy|={}mm，等待 90s 走完行程", abs(dy));
         // 等待x轴和y轴移动
         sleep(90);
         if (!running) return;
+        {
+            long long sec = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - t_move0).count();
+            rotating_logger->info("二次校准: 移动等待结束 耗时={}s，发布 status=2", sec);
+        }
         // 移动到位：发布纠偏完成状态 2，等待 aruco/reset 指令（此时 complete 保持 0）
-        publish_calib_status(2); // 2=纠偏完成（移动到位）
+        publish_calib_status_xy(2, dx, dy); // 2=纠偏完成（移动到位）+ 本次检测值
         rotating_logger->info("移动到位，等待 aruco/reset 指令...");
         // 等待收到 aruco/reset 消息（on_mqtt_message 置 g_reset_req）
         while (!g_reset_req.load() && running)
@@ -1124,13 +1190,18 @@ void run_calibration_sequence()
         // 复位完成：complete=1 持续 10 秒（由状态线程每秒发布）
         g_complete_remaining.store(10);
         rotating_logger->info("复位完成，aruco/reset/complete=1 持续 10 秒");
-        rotating_logger->info("二次校准完成");
+        {
+            long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t_cal0).count();
+            rotating_logger->info("二次校准完成 总耗时={}s（含复位40s+移动90s）", ms / 1000);
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "操作失败: " << e.what() << std::endl;
-        rotating_logger->error("二次校准操作失败");
-        publish_calib_status(0);
+        // 诊断（2026-11-13）：把异常原因写进日志，原来只写"操作失败"看不出卡在哪
+        rotating_logger->error("二次校准失败: {} (已发布 status=0 供上游判断)", e.what());
+        publish_calib_status_xy(0, dx, dy, e.what());
     }
     g_calib_req.store(false);
 }
@@ -1529,6 +1600,7 @@ void ProcessDetection()
         // 非阻塞取最新检测帧
         if (contour_queue.pop(data, 0))
         {
+            g_last_detect_ms.store(now_ms());
             const float dk1 = 0.05f;
             const float dk2 = 0.15f;
             float x = 0.0; // 纵向偏移（相对基准 310）
@@ -1592,21 +1664,15 @@ void ProcessDetection()
             }
 
             // ===== 第三步：rotation 用 rect；dx/dy 用最上面孔中心的质心 =====
-            // 诊断日志：每 10 帧打印一次，确认 hole 检出数量与选中的孔
-            {
-                static int dbg_count = 0;
-                if (++dbg_count % 10 == 0)
-                {
-                    std::string hc;
-                    for (auto &p : top_centers) hc += "(" + std::to_string(p.x) + "," + std::to_string(p.y) + ") ";
-                    rotating_logger->info("检测结果 rect={} hole={} top_hole={} 选中孔=[{}]",
-                                          the_rect ? "Y" : "N", holes.size(), top_centers.size(), hc);
-                }
-            }
+            // 2026-11-13：检测框/孔位/角度/分档 合并成下面「纠偏」一行输出（每 10 个有效帧），不再分散成 3 行
             // 有效落点需同时满足：检测到 rect + 至少 3 个孔（缺孔用 3 个连线）
             if (the_rect != nullptr && top_centers.size() >= 3)
             {
                 detected = true;
+                g_last_valid_ms.store(now_ms());
+                // 诊断汇总用：rotation 三路对照值（pca4/rect/geo4），供下面「纠偏」单行打印
+                float diag_rect_deg = 0.f, diag_geo_deg = 0.f, diag_pca_deg = 0.f;
+                bool diag_has_geo = false;
                 // 逐步收敛（2026-11-11）：rotation 限幅 ±10° + 死区 1°
                 // 飞控 yaw_rate_sp = 0.8*rotation（角速度），限幅后角速度≤8°/s，避免过冲；
                 // 真实偏角减小 -> rotation 减小 -> 角速度减小，逐步收敛；<1° 报 0（只滤噪声，保留 1~3° 继续纠正）。
@@ -1660,18 +1726,11 @@ void ProcessDetection()
                     else if (rot >  ROT_MAX)        rot =  ROT_MAX;
                     else if (rot < -ROT_MAX)        rot = -ROT_MAX;
                     rotation = rot;
-
-                    static int acount = 0;
-                    if (++acount % 10 == 0)
-                    {
-                        const float D = 57.2957795f;
-                        if (has_geo)
-                            rotating_logger->info("角度对比 rect={:+.2f} geo4={:+.2f} pca4={:+.2f} send={:+.2f} | send-geo={:+.2f}",
-                                                  rect_rot * D, geo4 * D, pca4 * D, rotation * D, (rotation - geo4) * D);
-                        else
-                            rotating_logger->info("角度对比 rect={:+.2f} geo4=N/A pca4=N/A send={:+.2f} (仅{}孔)",
-                                                  rect_rot * D, rotation * D, (int)top_centers.size());
-                    }
+                    // 2026-11-13：三路角度不再单独打一行，收进「纠偏」汇总行
+                    diag_rect_deg = rect_rot * 57.2957795f;
+                    diag_geo_deg = geo4 * 57.2957795f;
+                    diag_pca_deg = pca4 * 57.2957795f;
+                    diag_has_geo = has_geo;
                 }
                 }
 
@@ -1700,10 +1759,63 @@ void ProcessDetection()
                 const float COMP_K = 1.11f;
                 if (dyMid) dy *= COMP_K;
                 if (dxMid) dx *= COMP_K;
+                // 诊断（2026-11-13）：每 10 个有效帧一行，把"检测 → 角度 → 像素偏移 → 分档 → 实际发送值"写全
+                {
+                    static int out_cnt = 0;
+                    if (++out_cnt % 10 == 0)
+                    {
+                        const char *bx = dxMid ? "中0.05" : (fabsf(dx) >= 0.14f ? "大0.15" : "死区0.01");
+                        const char *by = dyMid ? "中0.05" : (fabsf(dy) >= 0.14f ? "大0.15" : "死区0.01");
+                        char ang[128];
+                        if (diag_has_geo)
+                            snprintf(ang, sizeof(ang), "pca4=%+.2f rect=%+.2f geo4=%+.2f",
+                                     diag_pca_deg, diag_rect_deg, diag_geo_deg);
+                        else
+                            snprintf(ang, sizeof(ang), "rect=%+.2f (仅%d孔,无geo4/pca4)",
+                                     diag_rect_deg, (int)top_centers.size());
+                        rotating_logger->info(
+                            "纠偏 valid=1 孔={}/{} 框心=({},{}) conf={:.2f} | px=(纵{:+.1f},横{:+.1f}) | dx={:+.4f}m[{}] dy={:+.4f}m[{}] | 角 {} → send={:+.2f}°",
+                            (int)top_centers.size(), (int)holes.size(),
+                            (int)((the_rect->x1 + the_rect->x2) / 2), (int)((the_rect->y1 + the_rect->y2) / 2),
+                            the_rect->confidence,
+                            x, y, dx, bx, dy, by, ang, rotation * 57.2957795f);
+                    }
+                }
+            }
+            else
+            {
+                // 诊断（2026-11-13）：无效帧只在"原因变化"或每 30 帧(≈1s)记一条，不刷屏
+                static int inv_cnt = 0;
+                static int last_reason = -1;
+                const int reason = (the_rect == nullptr) ? 0 : (int)top_centers.size();
+                if (reason != last_reason)
+                {
+                    inv_cnt = 0;
+                    last_reason = reason;
+                    if (the_rect == nullptr)
+                        rotating_logger->warn("未纠偏 valid=0 原因=未检出板框(rect)");
+                    else
+                        rotating_logger->warn("未纠偏 valid=0 原因=孔数不足 {}/4(至少 3 孔)", top_centers.size());
+                }
+                else if (++inv_cnt % 30 == 0)
+                {
+                    rotating_logger->warn("未纠偏持续 valid=0 原因={} 已 {} 帧",
+                                          the_rect == nullptr ? "未检出板框" : "孔数不足", inv_cnt);
+                }
             }
         }
         contour_queue.clear();
 
+        // 诊断：5s 以上没有检测结果 → 推理线程/视频流异常（每 5s 一条，不刷屏）
+        {
+            static long long last_stall_warn = 0;
+            long long ld = g_last_detect_ms.load();
+            if (ld > 0 && now_ms() - ld > 5000 && now_ms() - last_stall_warn > 5000)
+            {
+                last_stall_warn = now_ms();
+                rotating_logger->warn("检测停滞: {}s 无检测结果（检查视频流/推理线程）", (now_ms() - ld) / 1000);
+            }
+        }
         // 恒定 30Hz 发布：有检测发真实值，无检测发 0（valid=false, dx=0, dy=0）
         publish_detection(detected, dx, dy, rotation);
         usleep(30000); // 30Hz 周期（约 33ms）
@@ -1845,12 +1957,8 @@ void Detect()
                     // 转换为std::string后比较
                     std::string cls_name_str = (cls_name == nullptr) ? "" : cls_name;
                     if (cls_name_str == "rect") {
-                        // 字符串内容是"rect"，执行逻辑
-                        // cout << "类别名称是rect" << endl;
-                        rotating_logger->debug("{} @ ({}, {}, {}, {}) {:.3f}",
-                                           cls_name, det_result.box.left, det_result.box.top,
-                                           det_result.box.right, det_result.box.bottom, det_result.prop);
-                
+                        // 2026-11-13：原先每帧一行 rect 框 debug，属"无效/低价值刷屏"，已移除；
+                        // 框心/置信度并入消息线程的「检测结果 valid=1」行，只在有效帧输出
                     }
                     // if (cls_name =="rect") 
                     // {
@@ -1888,8 +1996,8 @@ void Detect()
                 // 计算推理时间
                 gettimeofday(&stop_time, nullptr);
                 const float t = (__get_us(stop_time) - __get_us(start_time)) / 1000.0f;
-                if (count % (10) == 0)
-                { // 每10帧打印一次
+                if (count % (100) == 0)
+                { // 每100帧打印一次（约5s，2026-11-13：原来每10帧≈2条/秒，属刷屏）
                     rotating_logger->info("推理时间: {:.6f} ms, FPS: {:.2f}", t, 1000.0f / t);
                 }
 

@@ -14,7 +14,7 @@ USER = "cat"
 PASS = "temppwd"
 HOSTNAME = "lubancat"
 LOG = "/home/cat/Flght_con/flght_control/install/rk3588_linux/log/rotating_log.log"
-KEEP = ("角度对比", "检测结果")   # 只显示这两类行
+KEEP = ("角度对比", "检测结果", "纠偏")   # 兼容两版日志格式
 
 
 def probe(ip, timeout=0.7):
