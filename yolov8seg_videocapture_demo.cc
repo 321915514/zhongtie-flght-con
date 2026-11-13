@@ -1627,17 +1627,34 @@ void ProcessDetection()
                     };
                     const float rect_rot = min_straighten_angle(the_rect->angle);
                     float rot = rect_rot;
+                    float geo4 = 0.0f, pca4 = 0.0f;
+                    bool has_geo = false;
                     if (top_centers.size() >= 4)
                     {
+                        // ① 凸包序：按相对中心的极角排序，得到真实相邻的四条边（y 升序连会交叉成蝴蝶形，是错的）
                         float cx = 0.f, cy = 0.f;
                         for (auto &p : top_centers) { cx += p.x; cy += p.y; }
                         cx /= (float)top_centers.size(); cy /= (float)top_centers.size();
+                        std::vector<cv::Point2f> hull = top_centers;
+                        std::sort(hull.begin(), hull.end(), [&](const cv::Point2f &a, const cv::Point2f &b) {
+                            return atan2f(a.y - cy, a.x - cx) < atan2f(b.y - cy, b.x - cx);
+                        });
+                        // ② 四条边角度平均（短边/长边平行，wrap45 后同向）→ 几何真值
+                        float sum = 0.f;
+                        for (int i = 0; i < 4; ++i) {
+                            const auto &p = hull[i], &q = hull[(i + 1) % 4];
+                            sum += wrap45(atan2f(q.y - p.y, q.x - p.x));
+                        }
+                        geo4 = sum * 0.25f;
+                        rot = geo4;
+                        has_geo = true;
+                        // ③ PCA 主轴（仅作对照参考）
                         float sxx = 0.f, syy = 0.f, sxy = 0.f;
                         for (auto &p : top_centers) {
                             float dx = p.x - cx, dy = p.y - cy;
                             sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
                         }
-                        rot = wrap45(0.5f * atan2f(2.0f * sxy, sxx - syy));   // PCA 主轴
+                        pca4 = wrap45(0.5f * atan2f(2.0f * sxy, sxx - syy));
                     }
                     if (fabsf(rot) < ROT_DEAD)      rot = 0.0f;
                     else if (rot >  ROT_MAX)        rot =  ROT_MAX;
@@ -1646,10 +1663,15 @@ void ProcessDetection()
 
                     static int acount = 0;
                     if (++acount % 10 == 0)
-                        rotating_logger->info("角度对比 rect_deg={:.2f} pca4_deg={:.2f} send_deg={:.2f}",
-                                              rect_rot * 57.2957795f,
-                                              (top_centers.size() >= 4 ? rot : 0.f) * 57.2957795f,
-                                              rotation * 57.2957795f);
+                    {
+                        const float D = 57.2957795f;
+                        if (has_geo)
+                            rotating_logger->info("角度对比 rect={:+.2f} geo4={:+.2f} pca4={:+.2f} send={:+.2f} | send-geo={:+.2f}",
+                                                  rect_rot * D, geo4 * D, pca4 * D, rotation * D, (rotation - geo4) * D);
+                        else
+                            rotating_logger->info("角度对比 rect={:+.2f} geo4=N/A pca4=N/A send={:+.2f} (仅{}孔)",
+                                                  rect_rot * D, rotation * D, (int)top_centers.size());
+                    }
                 }
                 }
 
