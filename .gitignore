@@ -13,3 +13,5 @@ __pycache__/
 backup_*/
 backups/
 saved_images/
+*.bak_*
+*.bak.*
