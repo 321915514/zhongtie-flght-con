@@ -1,10 +1,21 @@
 @echo off
 chcp 65001 >nul
-title 降落 rotation 实时监控 (Ctrl+C 退出)
+title 降落 rotation 实时监控（自动找板子 / Ctrl+C 退出）
+cd /d "%~dp0"
+
+set "UV=C:\Users\Qi\AppData\Local\hermes\bin\uv.exe"
+if not exist "%UV%" set "UV=uv"
+
 echo ============================================================
-echo  实时看板端 rotation：rect / geo4 / pca4 / send
-echo  板子: 192.168.0.199   密码: 见项目约定
-echo  判断标准：send 应等于 geo4；geo4 与 pca4/rect 三者接近=稳定
+echo  自动扫描板子 IP（hostname=lubancat）并登录，实时显示：
+echo    角度对比 rect / geo4 / pca4 / send
+echo    检测结果 四孔坐标
+echo  判断：geo4 跟随实际转角；正常关系 rect ^> geo4 ^> pca4
+echo  Ctrl+C 退出
 echo ============================================================
 echo.
-ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no cat@192.168.0.199 "tail -n 20 -f /home/cat/Flght_con/flght_control/install/rk3588_linux/log/rotating_log.log" | findstr /C:"角度对比" /C:"检测结果"
+
+"%UV%" run --with paramiko python "%~dp0watch_rotation.py" %*
+echo.
+echo === 已退出 ===
+pause
